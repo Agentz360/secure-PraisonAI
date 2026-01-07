@@ -189,7 +189,7 @@ def __getattr__(name):
         _lazy_cache[name] = AutoAgents
         return AutoAgents
     
-    # Session (imports requests)
+    # Session (imports requests lazily via session/api.py)
     elif name == "Session":
         from .session import Session
         _lazy_cache[name] = Session

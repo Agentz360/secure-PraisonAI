@@ -9,9 +9,9 @@ import pytest
 
 
 def clear_modules():
-    """Clear all praisonai and litellm related modules from cache."""
+    """Clear all praisonai, litellm, and requests related modules from cache."""
     to_remove = [m for m in list(sys.modules.keys()) 
-                 if 'praison' in m or 'litellm' in m]
+                 if 'praison' in m or 'litellm' in m or m == 'requests' or m.startswith('requests.')]
     for mod in to_remove:
         del sys.modules[mod]
 
@@ -100,7 +100,7 @@ class TestLazyImports:
         for name in praisonaiagents.__all__:
             # Some items may be None if optional deps not installed
             try:
-                attr = getattr(praisonaiagents, name)
+                _ = getattr(praisonaiagents, name)
                 # Just verify it's accessible, may be None
             except AttributeError:
                 pytest.fail(f"'{name}' in __all__ but not accessible")
