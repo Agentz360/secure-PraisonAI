@@ -4,8 +4,6 @@ PraisonAI CLI Typer Application.
 Main Typer app that registers all command groups and handles global options.
 """
 
-import os
-import sys
 from enum import Enum
 from typing import Optional
 
@@ -192,6 +190,8 @@ def register_commands():
     from .commands.workflow import app as workflow_app
     from .commands.tools import app as tools_app
     from .commands.knowledge import app as knowledge_app
+    from .commands.rag import app as rag_app
+    from .commands import retrieval as retrieval_module
     from .commands.deploy import app as deploy_app
     from .commands.agents import app as agents_app
     from .commands.skills import app as skills_app
@@ -230,9 +230,9 @@ def register_commands():
     app.add_typer(profile_app, name="profile", help="Performance profiling and diagnostics")
     app.add_typer(benchmark_app, name="benchmark", help="Comprehensive performance benchmarking")
     
-    # Register sub-apps - Previously legacy-only commands (now visible in --help)
-    app.add_typer(chat_app, name="chat", help="Interactive chat mode")
-    app.add_typer(code_app, name="code", help="Code assistant mode")
+    # Register sub-apps - Terminal-native commands
+    app.add_typer(chat_app, name="chat", help="Terminal-native interactive chat (REPL)")
+    app.add_typer(code_app, name="code", help="Terminal-native code assistant")
     app.add_typer(call_app, name="call", help="Voice/call interaction mode")
     app.add_typer(realtime_app, name="realtime", help="Realtime interaction mode")
     app.add_typer(train_app, name="train", help="Model training and fine-tuning")
@@ -242,7 +242,11 @@ def register_commands():
     app.add_typer(memory_app, name="memory", help="Memory management")
     app.add_typer(workflow_app, name="workflow", help="Workflow management")
     app.add_typer(tools_app, name="tools", help="Tool management")
-    app.add_typer(knowledge_app, name="knowledge", help="Knowledge base management")
+    app.add_typer(knowledge_app, name="knowledge", help="Knowledge base management (legacy)")
+    app.add_typer(rag_app, name="rag", help="RAG commands (legacy - use index/query instead)")
+    
+    # Register unified retrieval commands (Agent-first)
+    retrieval_module.register_commands(app)
     app.add_typer(deploy_app, name="deploy", help="Deployment management")
     app.add_typer(agents_app, name="agents", help="Agent management")
     app.add_typer(skills_app, name="skills", help="Skill management")
