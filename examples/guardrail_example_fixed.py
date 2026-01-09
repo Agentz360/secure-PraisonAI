@@ -4,7 +4,7 @@ Fixed example demonstrating proper guardrail usage with PraisonAI Agents.
 This addresses the issues reported in issue #875.
 """
 
-from praisonaiagents import Agent, Task, GuardrailResult, PraisonAIAgents, TaskOutput
+from praisonaiagents import Agent, Task, GuardrailResult, Agents, TaskOutput
 from typing import Tuple, Any
 import trafilatura
 
@@ -67,7 +67,7 @@ agent = Agent(
     goal="Summarize web content concisely",
     instructions="You are a helpful assistant that summarizes web content",
     llm="gemini/gemini-2.5-flash-lite-preview-06-17",
-    self_reflect=False,
+    reflection=False,
     verbose=True,
     tools=[get_url_context]  # FIX: tools must be a list, not a single function
 )
@@ -77,7 +77,7 @@ task_with_guardrailresult = Task(
     name="summarise article with GuardrailResult",
     description="get the context of this url: https://blog.google/technology/ai/dolphingemma/ and produce a summary below 500 characters",
     agent=agent,
-    guardrail=validate_length_guardrailresult,  # Using GuardrailResult
+    guardrails=validate_length_guardrailresult,  # Using GuardrailResult
     expected_output="summary of the article below 500 characters",
     max_retries=3  # Will retry up to 3 times if guardrail fails
 )
@@ -87,7 +87,7 @@ task_with_tuple = Task(
     name="summarise article with tuple",
     description="get the context of this url: https://blog.google/technology/ai/dolphingemma/ and produce a summary below 500 characters",
     agent=agent,
-    guardrail=validate_length_tuple,  # Using Tuple[bool, Any]
+    guardrails=validate_length_tuple,  # Using Tuple[bool, Any]
     expected_output="summary of the article below 500 characters",
     max_retries=3
 )
@@ -97,13 +97,13 @@ task_with_llm_guardrail = Task(
     name="summarise with LLM guardrail",
     description="get the context of this url: https://blog.google/technology/ai/dolphingemma/ and produce a summary",
     agent=agent,
-    guardrail="Ensure the summary is professional, factual, and between 100-500 characters",
+    guardrails="Ensure the summary is professional, factual, and between 100-500 characters",
     expected_output="professional summary of the article"
 )
 
 # Run with GuardrailResult example
 print("=== Running with GuardrailResult guardrail ===")
-agents_gr = PraisonAIAgents(
+agents_gr = Agents(
     agents=[agent],
     tasks=[task_with_guardrailresult]
 )
@@ -113,7 +113,7 @@ agents_gr = PraisonAIAgents(
 
 # Run with Tuple example
 print("\n=== Running with Tuple[bool, Any] guardrail ===")
-agents_tuple = PraisonAIAgents(
+agents_tuple = Agents(
     agents=[agent],
     tasks=[task_with_tuple]
 )
@@ -123,7 +123,7 @@ agents_tuple = PraisonAIAgents(
 
 # Run with LLM guardrail example
 print("\n=== Running with LLM-based guardrail ===")
-agents_llm = PraisonAIAgents(
+agents_llm = Agents(
     agents=[agent],
     tasks=[task_with_llm_guardrail]
 )

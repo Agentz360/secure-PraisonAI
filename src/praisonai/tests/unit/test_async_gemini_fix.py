@@ -4,7 +4,7 @@ after the fix for issue #818
 """
 import asyncio
 import logging
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 # Enable logging to see tool calls
 logging.basicConfig(level=logging.INFO)
@@ -40,8 +40,7 @@ async def test_async_gemini_tools():
         goal="Find information using the search tool",
         backstory="You are an expert at finding information online",
         tools=[mock_search],
-        llm={"model": "gemini/gemini-1.5-flash-latest"},
-        verbose=True
+        llm={"model": "gemini/gemini-1.5-flash-latest"}
     )
     
     # Create analysis agent without tools
@@ -50,8 +49,7 @@ async def test_async_gemini_tools():
         role="Data Analyst",
         goal="Analyze search results",
         backstory="You excel at analyzing and summarizing information",
-        llm={"model": "gemini/gemini-1.5-flash-latest"},
-        verbose=True
+        llm={"model": "gemini/gemini-1.5-flash-latest"}
     )
     
     # Create tasks
@@ -73,10 +71,9 @@ async def test_async_gemini_tools():
     )
     
     # Create workflow
-    workflow = PraisonAIAgents(
+    workflow = Agents(
         agents=[search_agent, analysis_agent],
-        tasks=[search_task, analysis_task],
-        verbose=True
+        tasks=[search_task, analysis_task]
     )
     
     # Execute async
@@ -129,7 +126,7 @@ async def test_multiple_async_agents():
         tasks.append(task)
     
     # Execute all in parallel
-    workflow = PraisonAIAgents(agents=agents, tasks=tasks)
+    workflow = Agents(agents=agents, tasks=tasks)
     
     print("\n🚀 Testing multiple async agents in parallel...")
     results = await workflow.astart()

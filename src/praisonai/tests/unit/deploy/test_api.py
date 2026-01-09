@@ -32,6 +32,8 @@ def test_start_api_server_background(mock_popen):
     config = APIConfig(host="0.0.0.0", port=8080)
     mock_process = Mock()
     mock_process.pid = 12345
+    mock_process.poll.return_value = None  # Process is still running
+    mock_process.stderr.read.return_value = ""  # No error output
     mock_popen.return_value = mock_process
     
     result = start_api_server("agents.yaml", config, background=True)
@@ -61,23 +63,27 @@ def test_generate_api_server_code_with_auth():
     assert "auth" in code.lower() or "token" in code.lower()
 
 
-@patch('subprocess.run')
-def test_check_api_health_success(mock_run):
+@patch('urllib.request.urlopen')
+def test_check_api_health_success(mock_urlopen):
     """Test checking API health successfully."""
     from praisonai.deploy.api import check_api_health
     
-    mock_run.return_value = Mock(returncode=0, stdout='{"status": "ok"}')
+    mock_response = Mock()
+    mock_response.status = 200
+    mock_response.__enter__ = Mock(return_value=mock_response)
+    mock_response.__exit__ = Mock(return_value=False)
+    mock_urlopen.return_value = mock_response
     
     result = check_api_health("http://localhost:8005")
     assert result is True
 
 
-@patch('subprocess.run')
-def test_check_api_health_failure(mock_run):
+@patch('urllib.request.urlopen')
+def test_check_api_health_failure(mock_urlopen):
     """Test checking API health failure."""
     from praisonai.deploy.api import check_api_health
     
-    mock_run.side_effect = Exception("Connection refused")
+    mock_urlopen.side_effect = Exception("Connection refused")
     
     result = check_api_health("http://localhost:8005")
     assert result is False

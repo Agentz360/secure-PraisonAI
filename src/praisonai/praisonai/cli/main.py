@@ -839,8 +839,15 @@ class PraisonAI:
         # Fast Context - codebase search
         parser.add_argument("--fast-context", type=str, help="Path to search for relevant code context")
         
-        # Handoff - agent delegation
+        # Handoff - agent delegation with unified HandoffConfig
         parser.add_argument("--handoff", type=str, help="Comma-separated agent roles for task delegation")
+        parser.add_argument("--handoff-policy", type=str, choices=["full", "summary", "none", "last_n"],
+                          help="Context sharing policy for handoffs (default: summary)")
+        parser.add_argument("--handoff-timeout", type=float, help="Timeout in seconds for handoff execution")
+        parser.add_argument("--handoff-max-depth", type=int, help="Maximum handoff chain depth (default: 10)")
+        parser.add_argument("--handoff-max-concurrent", type=int, help="Maximum concurrent handoffs (default: 3)")
+        parser.add_argument("--handoff-detect-cycles", type=str, choices=["true", "false"],
+                          help="Enable cycle detection in handoff chains (default: true)")
         
         # Auto Memory - automatic memory extraction
         parser.add_argument("--auto-memory", action="store_true", help="Enable automatic memory extraction")
@@ -1273,6 +1280,31 @@ class PraisonAI:
                 exit_code = handle_eval_command(unknown_args)
                 sys.exit(exit_code)
             
+            elif args.command == 'audit':
+                # Audit command - agent-centric compliance auditing
+                from .commands.audit import audit as audit_cli
+                import click
+                # Parse subcommand and args
+                if unknown_args and unknown_args[0] == 'agent-centric':
+                    # Build click args
+                    click_args = unknown_args[1:]
+                    try:
+                        audit_cli.main(['agent-centric'] + click_args, standalone_mode=False)
+                    except click.exceptions.Exit as e:
+                        sys.exit(e.exit_code)
+                    except SystemExit as e:
+                        sys.exit(e.code if e.code else 0)
+                else:
+                    print("Usage: praisonai audit agent-centric [--scan|--fix|--check] PATH")
+                    print("\nOptions:")
+                    print("  --scan PATH      Scan path for compliance")
+                    print("  --fix PATH       Fix non-compliant files")
+                    print("  --check PATH     Check and fail if non-compliant")
+                    print("  --json           Output as JSON")
+                    print("  --line-limit N   Line limit for header scan (default: 40)")
+                    print("  --verbose, -v    Verbose output")
+                sys.exit(0)
+            
             elif args.command == 'templates':
                 # Templates command - manage and run templates/recipes
                 from .features.templates import handle_templates_command
@@ -1513,7 +1545,7 @@ class PraisonAI:
                 print("\npip install \"praisonai\\[crewai]\"  # For CrewAI")
                 print("pip install \"praisonai\\[autogen]\"  # For AutoGen")
                 print("pip install \"praisonai\\[crewai,autogen]\"  # For both frameworks\n")
-                print("pip install praisonaiagents # For PraisonAIAgents\n")  
+                print("pip install praisonaiagents # For Agents\n")  
                 sys.exit(1)
 
         # Handle direct prompt if command is not a special command or file
@@ -3559,12 +3591,12 @@ Provide ONLY the commit message, no explanations."""
                 "backstory": "You are a helpful AI assistant"
             }
             
-            # Set verbose=False by default, only enable with --verbose flag
-            # This shows minimal "Generating..." status instead of full Agent Info panels
+            # Set output mode based on --verbose flag
+            # Uses consolidated 'output' param instead of deprecated 'verbose'
             if hasattr(self, 'args') and getattr(self.args, 'verbose', False):
-                agent_config["verbose"] = True
+                agent_config["output"] = "verbose"
             else:
-                agent_config["verbose"] = False
+                agent_config["output"] = "minimal"
             
             # Load default tools (same as interactive mode) unless --no-tools is set
             if not getattr(self.args, 'no_tools', False):
@@ -3648,7 +3680,7 @@ Provide ONLY the commit message, no explanations."""
                 
                 if getattr(self.args, 'history', None):
                     agent_config["memory"] = True  # History requires memory
-                    agent_config["history_in_context"] = self.args.history
+                    # Note: history_in_context param removed - history loading now via context= param
                     print(f"[bold cyan]History enabled - loading context from last {self.args.history} session(s)[/bold cyan]")
                 
                 # Claude Memory Tool (Anthropic only)
@@ -3784,9 +3816,20 @@ Provide ONLY the commit message, no explanations."""
                 if getattr(self.args, 'handoff', None):
                     from .features.handoff import HandoffHandler
                     handoff_handler = HandoffHandler(verbose=getattr(self.args, 'verbose', False))
+                    
+                    # Parse handoff config options
+                    detect_cycles = None
+                    if getattr(self.args, 'handoff_detect_cycles', None):
+                        detect_cycles = self.args.handoff_detect_cycles.lower() == 'true'
+                    
                     agents = handoff_handler.create_agents_with_handoff(
                         handoff_handler.parse_agent_names(self.args.handoff),
-                        agent_config.get('llm')
+                        llm=agent_config.get('llm'),
+                        context_policy=getattr(self.args, 'handoff_policy', None),
+                        timeout_seconds=getattr(self.args, 'handoff_timeout', None),
+                        max_concurrent=getattr(self.args, 'handoff_max_concurrent', None),
+                        max_depth=getattr(self.args, 'handoff_max_depth', None),
+                        detect_cycles=detect_cycles,
                     )
                     if agents:
                         # Use first agent with handoff chain
@@ -4022,7 +4065,7 @@ Now, {final_instruction.lower()}:"""
             print("\npip install \"praisonai\\[crewai]\"  # For CrewAI")
             print("pip install \"praisonai\\[autogen]\"  # For AutoGen")
             print("pip install \"praisonai\\[crewai,autogen]\"  # For both frameworks\n")
-            print("pip install praisonaiagents # For PraisonAIAgents\n")  
+            print("pip install praisonaiagents # For Agents\n")  
             sys.exit(1)
 
     def _handle_profiled_prompt(self, prompt):
@@ -4315,7 +4358,7 @@ Now, {final_instruction.lower()}:"""
             praisonai agents.yaml --serve
         """
         import yaml
-        from praisonaiagents import Agent, PraisonAIAgents
+        from praisonaiagents import Agent, Agents
         
         # Determine the YAML file path
         yaml_file = None
@@ -4358,8 +4401,7 @@ Now, {final_instruction.lower()}:"""
                     goal=agent_config.get('goal', ''),
                     backstory=agent_config.get('backstory', ''),
                     instructions=agent_config.get('instructions', ''),
-                    llm=agent_config.get('llm', 'gpt-4o-mini'),
-                    verbose=False
+                    llm=agent_config.get('llm', 'gpt-4o-mini'), output="minimal"
                 )
                 agents_dict[agent_id] = agent
                 agents_list.append(agent)
@@ -4490,14 +4532,14 @@ Now, {final_instruction.lower()}:"""
         
         # Create and launch - with tasks if defined
         if tasks_list:
-            praison = PraisonAIAgents(
+            praison = Agents(
                 agents=agents_list, 
                 tasks=tasks_list,
                 process=process_type,
                 verbose=1 if verbose else 0
             )
         else:
-            praison = PraisonAIAgents(
+            praison = Agents(
                 agents=agents_list,
                 process=process_type,
                 verbose=1 if verbose else 0
@@ -4753,7 +4795,7 @@ Now, {final_instruction.lower()}:"""
             
             # If tools are provided, use Agent with tools first, then DeepResearchAgent
             if tools_list:
-                from praisonaiagents import Agent, Task, PraisonAIAgents
+                from praisonaiagents import Agent, Task, Agents
                 
                 # Create a research assistant agent with tools
                 research_assistant = Agent(
@@ -4762,8 +4804,7 @@ Now, {final_instruction.lower()}:"""
                     goal="Gather relevant information using available tools",
                     backstory="You are an expert at using tools to gather information for research.",
                     tools=tools_list,
-                    llm="gpt-4o-mini",
-                    verbose=False
+                    llm="gpt-4o-mini", output="minimal"
                 )
                 
                 # Create task to gather initial information
@@ -4774,7 +4815,7 @@ Now, {final_instruction.lower()}:"""
                 )
                 
                 print("[cyan]Gathering information with tools...[/cyan]")
-                agents = PraisonAIAgents(agents=[research_assistant], tasks=[gather_task], verbose=0)
+                agents = Agents(agents=[research_assistant], tasks=[gather_task], verbose=0)
                 tool_results = agents.start()
                 
                 # Enhance query with tool results
@@ -5630,7 +5671,7 @@ Provide a concise summary (max 200 words):"""
                 role="Conversation Summarizer",
                 goal="Create concise summaries of conversations",
                 backstory="You summarize conversations while preserving key information.",
-                verbose=False,
+                output="minimal",
                 llm=session_state['current_model']
             )
             
@@ -5908,7 +5949,7 @@ Provide a concise summary (max 200 words):"""
                                 goal="Help the user with their tasks",
                                 backstory=backstory,
                                 tools=tools_list if tools_list else None,
-                                verbose=False,
+                                output="minimal",
                                 llm=model
                             )
                             
@@ -6051,7 +6092,7 @@ Provide a concise summary (max 200 words):"""
                     goal="Help the user with their tasks",
                     backstory="You are a helpful AI assistant with access to tools for file operations, shell commands, and web search. Use tools when needed to complete tasks.",
                     tools=tools_list if tools_list else None,
-                    verbose=False,  # Suppress verbose panels
+                    output="minimal",  # Suppress verbose panels
                     llm=model
                 )
             timings['agent_create_end'] = time.time()

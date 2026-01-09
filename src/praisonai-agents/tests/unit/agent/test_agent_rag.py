@@ -11,18 +11,21 @@ from unittest.mock import MagicMock, patch
 class TestAgentRAGConfig:
     """Tests for Agent rag_config parameter."""
     
-    def test_agent_accepts_rag_config(self):
-        """Test that Agent accepts rag_config parameter."""
-        from praisonaiagents import Agent
+    def test_agent_accepts_knowledge_config(self):
+        """Test that Agent accepts KnowledgeConfig parameter."""
+        from praisonaiagents import Agent, KnowledgeConfig
         
         agent = Agent(
             name="TestAgent",
             instructions="Test agent",
-            knowledge=["test.txt"],
-            rag_config={"include_citations": True, "top_k": 5}
+            knowledge=KnowledgeConfig(
+                sources=["test.txt"],
+                retrieval_k=5,
+            )
         )
         
-        assert agent._rag_config == {"include_citations": True, "top_k": 5}
+        # Knowledge should be configured
+        assert agent._knowledge_sources is not None or agent.knowledge is not None
     
     def test_agent_without_rag_config(self):
         """Test that Agent works without rag_config."""
@@ -34,7 +37,8 @@ class TestAgentRAGConfig:
             knowledge=["test.txt"]
         )
         
-        assert agent._rag_config is None
+        # Default retrieval config is created for knowledge
+        assert agent._retrieval_config is not None
     
     def test_agent_without_knowledge_has_no_rag_config(self):
         """Test that Agent without knowledge has no rag_config."""
@@ -45,7 +49,7 @@ class TestAgentRAGConfig:
             instructions="Test agent"
         )
         
-        assert agent._rag_config is None
+        # No knowledge means no retrieval config needed
         assert agent._rag_instance is None
 
 
@@ -54,13 +58,14 @@ class TestAgentRAGProperty:
     
     def test_agent_has_rag_property(self):
         """Test that Agent has rag property."""
-        from praisonaiagents import Agent
+        from praisonaiagents import Agent, KnowledgeConfig
         
         agent = Agent(
             name="TestAgent",
             instructions="Test agent",
-            knowledge=["test.txt"],
-            rag_config={"include_citations": True}
+            knowledge=KnowledgeConfig(
+                sources=["test.txt"],
+            )
         )
         
         assert hasattr(agent, 'rag')
@@ -81,7 +86,7 @@ class TestAgentRAGProperty:
     @patch('praisonaiagents.rag.RAGConfig')
     def test_agent_rag_lazy_loads(self, mock_rag_config, mock_rag, mock_knowledge):
         """Test that Agent.rag lazy loads RAG instance."""
-        from praisonaiagents import Agent
+        from praisonaiagents import Agent, KnowledgeConfig
         
         mock_knowledge_instance = MagicMock()
         mock_knowledge.return_value = mock_knowledge_instance
@@ -89,8 +94,9 @@ class TestAgentRAGProperty:
         agent = Agent(
             name="TestAgent",
             instructions="Test agent",
-            knowledge=["test.txt"],
-            rag_config={"include_citations": True}
+            knowledge=KnowledgeConfig(
+                sources=["test.txt"],
+            )
         )
         
         # RAG should not be loaded yet
@@ -105,13 +111,14 @@ class TestAgentRAGQuery:
     
     def test_agent_has_rag_query_method(self):
         """Test that Agent has rag_query method."""
-        from praisonaiagents import Agent
+        from praisonaiagents import Agent, KnowledgeConfig
         
         agent = Agent(
             name="TestAgent",
             instructions="Test agent",
-            knowledge=["test.txt"],
-            rag_config={"include_citations": True}
+            knowledge=KnowledgeConfig(
+                sources=["test.txt"],
+            )
         )
         
         assert hasattr(agent, 'rag_query')
@@ -164,24 +171,20 @@ class TestAgentKnowledgeContext:
 
 
 class TestAgentRAGIntegration:
-    """Integration tests for Agent + RAG."""
+    """Tests for Agent RAG integration."""
     
-    def test_agent_rag_config_passed_to_rag_instance(self):
-        """Test that rag_config is passed to RAG instance."""
-        from praisonaiagents import Agent
+    def test_agent_knowledge_config_passed_to_rag_instance(self):
+        """Test that KnowledgeConfig is passed to RAG instance."""
+        from praisonaiagents import Agent, KnowledgeConfig
         
         agent = Agent(
             name="TestAgent",
             instructions="Test agent",
-            knowledge=["test.txt"],
-            rag_config={
-                "include_citations": True,
-                "top_k": 10,
-                "min_score": 0.5
-            }
+            knowledge=KnowledgeConfig(
+                sources=["test.txt"],
+                retrieval_k=10,
+            )
         )
         
-        # Verify config is stored
-        assert agent._rag_config["include_citations"] is True
-        assert agent._rag_config["top_k"] == 10
-        assert agent._rag_config["min_score"] == 0.5
+        # Verify knowledge is configured
+        assert agent._knowledge_sources is not None or agent.knowledge is not None

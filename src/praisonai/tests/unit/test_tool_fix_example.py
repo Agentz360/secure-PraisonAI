@@ -5,7 +5,7 @@ This example shows how agents now properly use tools instead of saying
 "I do not have access to the internet".
 """
 import logging
-from praisonaiagents import Agent, Task, PraisonAIAgents
+from praisonaiagents import Agent, Task, Agents
 
 # Enable debug logging to see tool processing
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -29,8 +29,7 @@ search_agent = Agent(
     goal="Find accurate information using the mock_search tool",
     backstory="Expert researcher skilled at finding and analyzing information from various sources",
     tools=[mock_search],
-    llm={"model": "gemini/gemini-1.5-flash-8b"},
-    verbose=True
+    llm={"model": "gemini/gemini-1.5-flash-8b"}
 )
 
 # Create a task that should trigger tool usage
@@ -48,10 +47,10 @@ def test_tool_usage():
     print("=" * 60)
     
     # Create workflow
-    workflow = PraisonAIAgents(
+    workflow = Agents(
         agents=[search_agent],
         tasks=[search_task],
-        verbose=True
+        output="verbose"
     )
     
     # Execute the workflow
