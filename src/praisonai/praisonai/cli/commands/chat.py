@@ -93,8 +93,45 @@ def chat_main(
         is_flag=False,
         flag_value="true",
     ),
+    # NEW: Additional consolidated params for ALL GREEN feature parity
+    planning: Optional[str] = typer.Option(
+        None, "--planning",
+        help="Enable planning mode. Use --planning for default, --planning=thorough for preset",
+        is_flag=False,
+        flag_value="true",
+    ),
+    context: Optional[str] = typer.Option(
+        None, "--context",
+        help="Enable context management. Use --context for default",
+        is_flag=False,
+        flag_value="true",
+    ),
+    output: Optional[str] = typer.Option(
+        None, "--output",
+        help="Output preset. Use --output=verbose, --output=minimal, --output=silent",
+    ),
+    execution: Optional[str] = typer.Option(
+        None, "--execution",
+        help="Execution preset. Use --execution=fast, --execution=thorough, --execution=unlimited",
+    ),
+    hooks: Optional[str] = typer.Option(
+        None, "--hooks",
+        help="Hooks config file path for lifecycle callbacks",
+    ),
+    caching: Optional[str] = typer.Option(
+        None, "--caching",
+        help="Enable caching. Use --caching for default, --caching=redis for preset",
+        is_flag=False,
+        flag_value="true",
+    ),
     profile: bool = typer.Option(False, "--profile", help="Enable CLI profiling (timing breakdown)"),
     profile_deep: bool = typer.Option(False, "--profile-deep", help="Enable deep profiling (cProfile stats, higher overhead)"),
+    # UI backend selection
+    ui_backend: str = typer.Option("auto", "--ui-backend", help="UI backend: auto, plain, rich, mg (middle-ground)"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON (forces plain backend)"),
+    no_color: bool = typer.Option(False, "--no-color", help="Disable colors"),
+    theme: str = typer.Option("default", "--theme", help="UI theme: default, dark, light, minimal"),
+    compact: bool = typer.Option(False, "--compact", help="Compact output mode"),
 ):
     """
     Start terminal-native interactive chat mode.
@@ -112,7 +149,6 @@ def chat_main(
         praisonai chat "Summarize this" --file README.md
         praisonai chat "What is 2+2?" --profile
     """
-    import asyncio
     import os
     
     # Set workspace if provided
@@ -137,53 +173,29 @@ def chat_main(
     # Parse memory flag: --no-memory takes precedence, then --memory value
     memory_value = _parse_memory_flag(memory, no_memory)
     
-    # Try InteractiveCore first (preferred terminal-native implementation)
-    try:
-        from praisonai.cli.interactive import InteractiveCore, InteractiveConfig
-        from praisonai.cli.interactive.frontends import RichFrontend
-        
-        config = InteractiveConfig(
-            model=model,
-            session_id=session_id,
-            continue_session=continue_session,
-            workspace=workspace or None,
-            verbose=verbose,
-            memory=memory_value,
-            files=list(file) if file else [],
-            autonomy=autonomy,
-        )
-        
-        core = InteractiveCore(config=config)
-        
-        if prompt:
-            # Single prompt mode
-            async def run_prompt():
-                if continue_session:
-                    core.continue_session()
-                response = await core.prompt(prompt)
-                print(response)
-            
-            asyncio.run(run_prompt())
-        else:
-            # Interactive REPL mode
-            frontend = RichFrontend(core=core, config=config)
-            asyncio.run(frontend.run())
-            
-    except ImportError:
-        # Fallback to legacy terminal-native interactive mode
-        _run_legacy_terminal_chat(
-            prompt=prompt,
-            model=model,
-            verbose=verbose,
-            memory=memory,
-            tools=tools,
-            user_id=user_id,
-            session_id=session_id,
-            continue_session=continue_session,
-            workspace=workspace,
-            no_acp=no_acp,
-            no_lsp=no_lsp,
-        )
+    # Use the new TUI application (Aider/Claude Code style)
+    from praisonai.cli.interactive.tui_app import PraisonTUI, TUIConfig
+    
+    tui_config = TUIConfig(
+        model=model or "gpt-4o-mini",
+        show_logo=not compact,
+        show_tips=not compact,
+        show_status_bar=not compact,
+        compact_mode=compact,
+        session_id=session_id,
+        workspace=workspace,
+    )
+    
+    tui = PraisonTUI(config=tui_config)
+    
+    if prompt:
+        # Single prompt mode
+        response = tui.run_single(prompt)
+        if response:
+            print(response)
+    else:
+        # Interactive TUI mode
+        tui.run()
 
 
 def _run_profiled_chat(
@@ -221,7 +233,6 @@ def _run_profiled_chat(
         "name": "ChatAgent",
         "role": "Assistant",
         "goal": "Help the user",
-        "verbose": verbose,
     }
     if model:
         agent_config["llm"] = model

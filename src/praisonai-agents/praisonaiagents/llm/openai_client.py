@@ -582,6 +582,8 @@ class OpenAIClient:
         console: Optional[Console] = None,
         display_fn: Optional[Callable] = None,
         reasoning_steps: bool = False,
+        stream_callback: Optional[Callable] = None,
+        emit_events: bool = False,
         **kwargs
     ) -> Optional[ChatCompletion]:
         """
@@ -596,17 +598,33 @@ class OpenAIClient:
             console: Console for output
             display_fn: Display function for live updates
             reasoning_steps: Whether to show reasoning steps
+            stream_callback: Optional callback for StreamEvent emission
+            emit_events: Whether to emit StreamEvents (requires stream_callback)
             **kwargs: Additional parameters for the API
             
         Returns:
             ChatCompletion object or None if error
         """
+        # Lazy import StreamEvent types only when needed
+        _emit = emit_events and stream_callback is not None
+        if _emit:
+            from ..streaming.events import StreamEvent, StreamEventType
+        
         try:
             # Default start time and console if not provided
             if start_time is None:
                 start_time = time.time()
             if console is None:
                 console = self.console
+            
+            # Emit REQUEST_START event
+            request_start_perf = time.perf_counter()
+            if _emit:
+                stream_callback(StreamEvent(
+                    type=StreamEventType.REQUEST_START,
+                    timestamp=request_start_perf,
+                    metadata={"model": model, "message_count": len(messages)}
+                ))
             
             # Create the response stream
             response_stream = self.sync_client.chat.completions.create(
@@ -615,28 +633,80 @@ class OpenAIClient:
                 temperature=temperature,
                 tools=tools if tools else None,
                 stream=True,
+                stream_options={"include_usage": True} if _emit else None,
                 **kwargs
             )
+            
+            # Emit HEADERS_RECEIVED event (stream object created means headers received)
+            if _emit:
+                stream_callback(StreamEvent(
+                    type=StreamEventType.HEADERS_RECEIVED,
+                    timestamp=time.perf_counter()
+                ))
             
             full_response_text = ""
             reasoning_content = ""
             chunks = []
+            first_token_emitted = False
+            last_content_time = None
+            ttft_logged = False
             
             # If display function provided, use Live display
             if display_fn:
                 with Live(
                     display_fn("", start_time),
                     console=console,
-                    refresh_per_second=4,
+                    refresh_per_second=10,  # Increased for more responsive streaming
                     transient=True,
                     vertical_overflow="ellipsis",
                     auto_refresh=True
                 ) as live:
                     for chunk in response_stream:
                         chunks.append(chunk)
-                        if chunk.choices[0].delta.content:
-                            full_response_text += chunk.choices[0].delta.content
+                        
+                        # Check for content delta
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            content = chunk.choices[0].delta.content
+                            full_response_text += content
+                            last_content_time = time.perf_counter()
+                            
+                            # Log TTFT on first token
+                            if not ttft_logged:
+                                ttft_ms = (last_content_time - request_start_perf) * 1000
+                                logging.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
+                                ttft_logged = True
+                            
+                            # Emit FIRST_TOKEN on first content
+                            if _emit and not first_token_emitted:
+                                stream_callback(StreamEvent(
+                                    type=StreamEventType.FIRST_TOKEN,
+                                    timestamp=last_content_time,
+                                    content=content
+                                ))
+                                first_token_emitted = True
+                            elif _emit:
+                                # Emit DELTA_TEXT for subsequent tokens
+                                stream_callback(StreamEvent(
+                                    type=StreamEventType.DELTA_TEXT,
+                                    timestamp=last_content_time,
+                                    content=content
+                                ))
+                            
                             live.update(display_fn(full_response_text, start_time))
+                        
+                        # Handle tool calls streaming
+                        if _emit and chunk.choices and hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
+                            for tc in chunk.choices[0].delta.tool_calls:
+                                stream_callback(StreamEvent(
+                                    type=StreamEventType.DELTA_TOOL_CALL,
+                                    timestamp=time.perf_counter(),
+                                    tool_call={
+                                        "index": tc.index,
+                                        "id": getattr(tc, 'id', None),
+                                        "name": getattr(tc.function, 'name', None) if tc.function else None,
+                                        "arguments": getattr(tc.function, 'arguments', None) if tc.function else None
+                                    }
+                                ))
                         
                         # Update live display with reasoning content if enabled
                         if reasoning_steps and hasattr(chunk.choices[0].delta, "reasoning_content"):
@@ -648,9 +718,60 @@ class OpenAIClient:
                 # Clear the last generating display with a blank line
                 console.print()
             else:
-                # Just collect chunks without display
+                # Just collect chunks without display, but still emit events
                 for chunk in response_stream:
                     chunks.append(chunk)
+                    
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        last_content_time = time.perf_counter()
+                        
+                        # Log TTFT on first token
+                        if not ttft_logged:
+                            ttft_ms = (last_content_time - request_start_perf) * 1000
+                            logging.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
+                            ttft_logged = True
+                        
+                        if _emit and not first_token_emitted:
+                            stream_callback(StreamEvent(
+                                type=StreamEventType.FIRST_TOKEN,
+                                timestamp=last_content_time,
+                                content=content
+                            ))
+                            first_token_emitted = True
+                        else:
+                            stream_callback(StreamEvent(
+                                type=StreamEventType.DELTA_TEXT,
+                                timestamp=last_content_time,
+                                content=content
+                            ))
+                    
+                    # Handle tool calls streaming
+                    if _emit and chunk.choices and hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
+                        for tc in chunk.choices[0].delta.tool_calls:
+                            stream_callback(StreamEvent(
+                                type=StreamEventType.DELTA_TOOL_CALL,
+                                timestamp=time.perf_counter(),
+                                tool_call={
+                                    "index": tc.index,
+                                    "id": getattr(tc, 'id', None),
+                                    "name": getattr(tc.function, 'name', None) if tc.function else None,
+                                    "arguments": getattr(tc.function, 'arguments', None) if tc.function else None
+                                }
+                            ))
+            
+            # Emit LAST_TOKEN and STREAM_END events
+            if _emit:
+                if last_content_time:
+                    stream_callback(StreamEvent(
+                        type=StreamEventType.LAST_TOKEN,
+                        timestamp=last_content_time
+                    ))
+                stream_callback(StreamEvent(
+                    type=StreamEventType.STREAM_END,
+                    timestamp=time.perf_counter(),
+                    metadata={"chunk_count": len(chunks)}
+                ))
             
             final_response = process_stream_chunks(chunks)
             return final_response
@@ -669,6 +790,8 @@ class OpenAIClient:
         console: Optional[Console] = None,
         display_fn: Optional[Callable] = None,
         reasoning_steps: bool = False,
+        stream_callback: Optional[Callable] = None,
+        emit_events: bool = False,
         **kwargs
     ) -> Optional[ChatCompletion]:
         """
@@ -683,17 +806,37 @@ class OpenAIClient:
             console: Console for output
             display_fn: Display function for live updates
             reasoning_steps: Whether to show reasoning steps
+            stream_callback: Optional callback for StreamEvent emission (can be sync or async)
+            emit_events: Whether to emit StreamEvents (requires stream_callback)
             **kwargs: Additional parameters for the API
             
         Returns:
             ChatCompletion object or None if error
         """
+        # Lazy import StreamEvent types only when needed
+        _emit = emit_events and stream_callback is not None
+        if _emit:
+            from ..streaming.events import StreamEvent, StreamEventType
+        
         try:
             # Default start time and console if not provided
             if start_time is None:
                 start_time = time.time()
             if console is None:
                 console = self.console
+            
+            # Emit REQUEST_START event
+            request_start_perf = time.perf_counter()
+            if _emit:
+                event = StreamEvent(
+                    type=StreamEventType.REQUEST_START,
+                    timestamp=request_start_perf,
+                    metadata={"model": model, "message_count": len(messages)}
+                )
+                if asyncio.iscoroutinefunction(stream_callback):
+                    await stream_callback(event)
+                else:
+                    stream_callback(event)
             
             # Create the response stream
             response_stream = await self.async_client.chat.completions.create(
@@ -702,28 +845,80 @@ class OpenAIClient:
                 temperature=temperature,
                 tools=tools if tools else None,
                 stream=True,
+                stream_options={"include_usage": True} if _emit else None,
                 **kwargs
             )
+            
+            # Emit HEADERS_RECEIVED event
+            if _emit:
+                event = StreamEvent(
+                    type=StreamEventType.HEADERS_RECEIVED,
+                    timestamp=time.perf_counter()
+                )
+                if asyncio.iscoroutinefunction(stream_callback):
+                    await stream_callback(event)
+                else:
+                    stream_callback(event)
             
             full_response_text = ""
             reasoning_content = ""
             chunks = []
+            first_token_emitted = False
+            last_content_time = None
+            
+            async def emit_event(event: 'StreamEvent'):
+                if asyncio.iscoroutinefunction(stream_callback):
+                    await stream_callback(event)
+                else:
+                    stream_callback(event)
             
             # If display function provided, use Live display
             if display_fn:
                 with Live(
                     display_fn("", start_time),
                     console=console,
-                    refresh_per_second=4,
+                    refresh_per_second=10,
                     transient=True,
                     vertical_overflow="ellipsis",
                     auto_refresh=True
                 ) as live:
                     async for chunk in response_stream:
                         chunks.append(chunk)
-                        if chunk.choices[0].delta.content:
-                            full_response_text += chunk.choices[0].delta.content
+                        
+                        if chunk.choices and chunk.choices[0].delta.content:
+                            content = chunk.choices[0].delta.content
+                            full_response_text += content
+                            last_content_time = time.perf_counter()
+                            
+                            if _emit and not first_token_emitted:
+                                await emit_event(StreamEvent(
+                                    type=StreamEventType.FIRST_TOKEN,
+                                    timestamp=last_content_time,
+                                    content=content
+                                ))
+                                first_token_emitted = True
+                            elif _emit:
+                                await emit_event(StreamEvent(
+                                    type=StreamEventType.DELTA_TEXT,
+                                    timestamp=last_content_time,
+                                    content=content
+                                ))
+                            
                             live.update(display_fn(full_response_text, start_time))
+                        
+                        # Handle tool calls streaming
+                        if _emit and chunk.choices and hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
+                            for tc in chunk.choices[0].delta.tool_calls:
+                                await emit_event(StreamEvent(
+                                    type=StreamEventType.DELTA_TOOL_CALL,
+                                    timestamp=time.perf_counter(),
+                                    tool_call={
+                                        "index": tc.index,
+                                        "id": getattr(tc, 'id', None),
+                                        "name": getattr(tc.function, 'name', None) if tc.function else None,
+                                        "arguments": getattr(tc.function, 'arguments', None) if tc.function else None
+                                    }
+                                ))
                         
                         # Update live display with reasoning content if enabled
                         if reasoning_steps and hasattr(chunk.choices[0].delta, "reasoning_content"):
@@ -738,6 +933,50 @@ class OpenAIClient:
                 # Just collect chunks without display
                 async for chunk in response_stream:
                     chunks.append(chunk)
+                    
+                    if _emit and chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        last_content_time = time.perf_counter()
+                        
+                        if not first_token_emitted:
+                            await emit_event(StreamEvent(
+                                type=StreamEventType.FIRST_TOKEN,
+                                timestamp=last_content_time,
+                                content=content
+                            ))
+                            first_token_emitted = True
+                        else:
+                            await emit_event(StreamEvent(
+                                type=StreamEventType.DELTA_TEXT,
+                                timestamp=last_content_time,
+                                content=content
+                            ))
+                    
+                    if _emit and chunk.choices and hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
+                        for tc in chunk.choices[0].delta.tool_calls:
+                            await emit_event(StreamEvent(
+                                type=StreamEventType.DELTA_TOOL_CALL,
+                                timestamp=time.perf_counter(),
+                                tool_call={
+                                    "index": tc.index,
+                                    "id": getattr(tc, 'id', None),
+                                    "name": getattr(tc.function, 'name', None) if tc.function else None,
+                                    "arguments": getattr(tc.function, 'arguments', None) if tc.function else None
+                                }
+                            ))
+            
+            # Emit LAST_TOKEN and STREAM_END events
+            if _emit:
+                if last_content_time:
+                    await emit_event(StreamEvent(
+                        type=StreamEventType.LAST_TOKEN,
+                        timestamp=last_content_time
+                    ))
+                await emit_event(StreamEvent(
+                    type=StreamEventType.STREAM_END,
+                    timestamp=time.perf_counter(),
+                    metadata={"chunk_count": len(chunks)}
+                ))
             
             final_response = process_stream_chunks(chunks)
             return final_response
@@ -904,7 +1143,9 @@ class OpenAIClient:
                 if display_fn and console:
                     # When verbose (display_fn provided), use streaming for better UX
                     try:
-                        with Live(display_fn("", start_time), console=console, refresh_per_second=4, transient=True) as live:
+                        request_start_perf = time.perf_counter()
+                        ttft_logged = False
+                        with Live(display_fn("", start_time), console=console, refresh_per_second=10, transient=True) as live:
                             # Use streaming when display_fn is provided for progressive display
                             response_stream = self.create_completion(
                                 messages=messages,
@@ -922,6 +1163,11 @@ class OpenAIClient:
                             for chunk in response_stream:
                                 chunks.append(chunk)
                                 if chunk.choices[0].delta.content:
+                                    # Log TTFT on first token
+                                    if not ttft_logged:
+                                        ttft_ms = (time.perf_counter() - request_start_perf) * 1000
+                                        logging.debug(f"TTFT (Time To First Token): {ttft_ms:.0f}ms")
+                                        ttft_logged = True
                                     full_response_text += chunk.choices[0].delta.content
                                     live.update(display_fn(full_response_text, start_time))
                             
