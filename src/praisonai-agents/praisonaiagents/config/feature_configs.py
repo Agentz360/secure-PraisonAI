@@ -391,9 +391,20 @@ class OutputConfig:
     
     Consolidates: verbose, markdown, stream, metrics, reasoning_steps, output_style
     
+    DEFAULT: output="silent" (zero overhead, fastest performance)
+    
     Usage:
-        # Simple preset
+        # Default is silent mode (no output overhead, programmatic use)
+        Agent(instructions="...")  # Uses output="silent"
+        
+        # Actions mode (tool calls + final output trace)
+        Agent(output="actions")
+        
+        # Verbose mode with Rich panels
         Agent(output="verbose")
+        
+        # JSON mode for piping
+        Agent(output="json")
         
         # With config
         Agent(output=OutputConfig(
@@ -404,11 +415,11 @@ class OutputConfig:
             reasoning_steps=True,
         ))
     """
-    # Verbosity
-    verbose: bool = True
+    # Verbosity - False by default for silent mode (fastest)
+    verbose: bool = False
     
-    # Formatting
-    markdown: bool = True
+    # Formatting - False by default for silent mode
+    markdown: bool = False
     
     # Streaming
     stream: bool = False
@@ -422,6 +433,14 @@ class OutputConfig:
     # Output style (custom styling)
     style: Optional[Any] = None
     
+    # Actions trace mode - shows tool calls, agent lifecycle, final output
+    # When True, registers callbacks and outputs to stderr
+    # DEFAULT: False for zero overhead (silent mode)
+    actions_trace: bool = False
+    
+    # JSON output mode - emit JSONL events for piping
+    json_output: bool = False
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -430,6 +449,8 @@ class OutputConfig:
             "stream": self.stream,
             "metrics": self.metrics,
             "reasoning_steps": self.reasoning_steps,
+            "actions_trace": self.actions_trace,
+            "json_output": self.json_output,
         }
 
 
