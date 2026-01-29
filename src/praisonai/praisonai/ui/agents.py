@@ -10,7 +10,7 @@ from praisonaiagents import Agent, Task, Agents, register_display_callback
 framework = "praisonai"
 config_list = [
     {
-        'model': os.environ.get("OPENAI_MODEL_NAME", "gpt-5-nano"),
+        'model': os.environ.get("OPENAI_MODEL_NAME", "gpt-4o-mini"),
         'base_url': os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
         'api_key': os.environ.get("OPENAI_API_KEY", "")
     }
@@ -439,17 +439,21 @@ async def ui_run_praisonai(config, topic, tools_dict):
                 max_execution_time=details.get('max_execution_time'),
                 cache=details.get('cache', True),
                 step_callback=step_callback_sync,
-                self_reflect=details.get('self_reflect', False)
+                reflection=details.get('self_reflect', False)
             )
             agents_map[role] = agent
 
         # Create tasks
+        # Import tool resolver for YAML tool resolution
+        from praisonai.tool_resolver import ToolResolver
+        tool_resolver = ToolResolver()
+        
         for role, details in config['roles'].items():
             agent = agents_map[role]
             role_name = agent.name
 
             # -------------------------------------------------------------
-            # FIX: Skip empty or invalid tool names to avoid null tool objects
+            # Tool resolution: local tools_dict first, then ToolResolver
             # -------------------------------------------------------------
             role_tools = []
             task_tools = []  # Initialize task_tools outside the loop
@@ -458,6 +462,10 @@ async def ui_run_praisonai(config, topic, tools_dict):
                 if not tool_name or not tool_name.strip():
                     logger.warning("Skipping empty tool name.")
                     continue
+                
+                tool_name = tool_name.strip()
+                
+                # First check local tools_dict (from tools.py)
                 if tool_name in tools_dict:
                     # Create a copy of the tool definition
                     tool_def = tools_dict[tool_name].copy()
@@ -468,7 +476,13 @@ async def ui_run_praisonai(config, topic, tools_dict):
                     # Add API tool definition to task's tools
                     task_tools.append(tool_def)
                 else:
-                    logger.warning(f"Tool '{tool_name}' not found. Skipping.")
+                    # Try to resolve from built-in tools via ToolResolver
+                    resolved_tool = tool_resolver.resolve(tool_name)
+                    if resolved_tool is not None:
+                        role_tools.append(resolved_tool)
+                        logger.info(f"Resolved tool '{tool_name}' from built-in tools")
+                    else:
+                        logger.warning(f"Tool '{tool_name}' not found. Skipping.")
             
             # Set the agent's tools after collecting all tools
             if role_tools:
@@ -641,7 +655,7 @@ async def set_profiles(current_user: cl.User):
 @cl.on_chat_start
 async def start_chat():
     try:
-        model_name = load_setting("model_name") or os.getenv("MODEL_NAME", "gpt-5-nano")
+        model_name = load_setting("model_name") or os.getenv("MODEL_NAME", "gpt-4o-mini")
         cl.user_session.set("model_name", model_name)
         logger.debug(f"Model name: {model_name}")
 

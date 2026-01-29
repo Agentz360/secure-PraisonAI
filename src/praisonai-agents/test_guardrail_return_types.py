@@ -51,7 +51,7 @@ def test_guardrail_return_types():
         role="Tester",
         goal="Test guardrails",
         backstory="Testing guardrail functionality",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Test creating tasks with each guardrail type
@@ -68,7 +68,7 @@ def test_guardrail_return_types():
                 description="Test task",
                 expected_output="Test output",
                 agent=agent,
-                guardrail=guardrail_func
+                guardrails=guardrail_func
             )
             print(f"✓ Task created successfully with {test_name}")
             
@@ -105,7 +105,7 @@ def test_guardrail_result_handling():
         role="Tester",
         goal="Test guardrails",
         backstory="Testing guardrail functionality",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     test_output = TaskOutput(
@@ -121,7 +121,7 @@ def test_guardrail_result_handling():
     task1 = Task(
         description="Test",
         agent=agent,
-        guardrail=return_guardrailresult
+        guardrails=return_guardrailresult
     )
     
     result1 = task1._process_guardrail(test_output)
@@ -136,7 +136,7 @@ def test_guardrail_result_handling():
     task2 = Task(
         description="Test",
         agent=agent,
-        guardrail=return_tuple
+        guardrails=return_tuple
     )
     
     result2 = task2._process_guardrail(test_output)

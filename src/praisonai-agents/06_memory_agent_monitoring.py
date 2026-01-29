@@ -65,7 +65,7 @@ def run_stateful_agent(query: str, session_id: str, conversation_turn: int):
         instructions="""You are a memory-enabled AI assistant. You can remember 
         previous conversations and build on past interactions. Use your memory 
         to provide personalized and contextual responses.""",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Pre-processing: retrieve relevant memories
@@ -165,7 +165,9 @@ def main():
     # Slowest operations
     print("\n🐌 Slowest Memory Operations:")
     slowest = get_slowest_functions()
-    for func_name, avg_time in slowest[:5]:  # Top 5 slowest
+    for item in slowest[:5]:  # Top 5 slowest
+        func_name = item.get('function', 'unknown')
+        avg_time = item.get('average_time', 0)
         print(f"  {func_name}: {avg_time:.3f}s average")
     
     # Memory operation breakdown

@@ -13,9 +13,9 @@ researcher = Agent(
     goal="Analyze and structure information about AI developments",
     backstory="Expert analyst specializing in AI technology trends",
     verbose=True,
-    llm="gpt-5-nano",
+    llm="gpt-4o-mini",
     tools=[Tools.internet_search],
-    self_reflect=False
+    reflection=False
 )
 
 # Create an analyst agent
@@ -25,8 +25,8 @@ analyst = Agent(
     goal="Structure and analyze research findings",
     backstory="Senior data analyst with expertise in pattern recognition",
     verbose=True,
-    llm="gpt-5-nano",
-    self_reflect=False
+    llm="gpt-4o-mini",
+    reflection=False
 )
 
 # Define structured tasks

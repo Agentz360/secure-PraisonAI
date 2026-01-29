@@ -19,8 +19,8 @@ def test_user_example():
     agent = Agent(
         instructions="You are a helpful assistant",
         llm="mock",  # Use mock model for testing
-        self_reflect=False,
-        verbose=False,
+        reflection=False,
+        output="silent",
         stream=True
     )
 

@@ -42,19 +42,19 @@ def collect_comprehensive_data():
     agents = {
         'quick_agent': Agent(
             instructions="You are a quick-response agent. Provide concise answers.",
-            llm="gpt-5-nano"
+            llm="gpt-4o-mini"
         ),
         'analytical_agent': Agent(
             instructions="You are an analytical agent. Provide detailed analysis.",
-            llm="gpt-5-nano"
+            llm="gpt-4o-mini"
         ),
         'research_agent': Agent(
             instructions="You are a research agent. Provide comprehensive information.",
-            llm="gpt-5-nano"
+            llm="gpt-4o-mini"
         ),
         'creative_agent': Agent(
             instructions="You are a creative agent. Provide imaginative responses.",
-            llm="gpt-5-nano"
+            llm="gpt-4o-mini"
         )
     }
     
@@ -98,19 +98,19 @@ def simulate_complex_workflow():
     planner = Agent(
         name="planner",
         instructions="You are a project planner. Break down tasks and plan execution.",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     executor = Agent(
         name="executor", 
         instructions="You are a task executor. Complete assigned tasks efficiently.",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     reviewer = Agent(
         name="reviewer",
         instructions="You are a quality reviewer. Review and improve work.",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create workflow tasks
@@ -143,7 +143,7 @@ def simulate_complex_workflow():
             agents=[planner, executor, reviewer],
             tasks=[planning_task, execution_task, review_task],
             process="sequential",
-            verbose=False
+            output="silent"
         )
         
         result = workflow.start()
@@ -302,13 +302,17 @@ def display_dashboard(dashboard_data, benchmark_results):
     perf_data = dashboard_data['performance_data']
     
     print("  Fastest Functions:")
-    fastest_functions = sorted(perf_data['slowest_functions'], key=lambda x: x[1])[:3]
-    for name, time in fastest_functions:
-        print(f"    {name}: {time:.3f}s")
+    fastest_functions = sorted(perf_data['slowest_functions'], key=lambda x: x.get('average_time', float('inf')))[:3]
+    for item in fastest_functions:
+        name = item.get('function', 'unknown')
+        time_val = item.get('average_time', 0)
+        print(f"    {name}: {time_val:.3f}s")
     
     print("  Slowest Functions:")
-    for name, time in perf_data['slowest_functions'][:3]:
-        print(f"    {name}: {time:.3f}s")
+    for item in perf_data['slowest_functions'][:3]:
+        name = item.get('function', 'unknown')
+        time_val = item.get('average_time', 0)
+        print(f"    {name}: {time_val:.3f}s")
     
     # Benchmark Results
     print(f"\n⚡ BENCHMARK RESULTS")

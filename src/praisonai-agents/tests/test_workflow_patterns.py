@@ -657,7 +657,7 @@ class TestGuardrails:
         def step1(ctx): return StepResult(output="Valid output")
         
         workflow = Workflow(steps=[
-            WorkflowStep(name="step1", handler=step1, guardrail=validator)
+            WorkflowStep(name="step1", handler=step1, guardrails=validator)
         ])
         result = workflow.start("test")
         
@@ -678,7 +678,7 @@ class TestGuardrails:
             return StepResult(output=f"Output attempt {attempt[0]}")
         
         workflow = Workflow(steps=[
-            WorkflowStep(name="step1", handler=step1, guardrail=validator, execution=WorkflowStepExecutionConfig(max_retries=5))
+            WorkflowStep(name="step1", handler=step1, guardrails=validator, execution=WorkflowStepExecutionConfig(max_retries=5))
         ])
         result = workflow.start("test")
         
@@ -697,7 +697,7 @@ class TestGuardrails:
             return StepResult(output=f"Attempt {attempt[0]}")
         
         workflow = Workflow(steps=[
-            WorkflowStep(name="step1", handler=step1, guardrail=validator, execution=WorkflowStepExecutionConfig(max_retries=2))
+            WorkflowStep(name="step1", handler=step1, guardrails=validator, execution=WorkflowStepExecutionConfig(max_retries=2))
         ])
         result = workflow.start("test")
         
@@ -721,7 +721,7 @@ class TestGuardrails:
             return StepResult(output="initial")
         
         workflow = Workflow(steps=[
-            WorkflowStep(name="step1", handler=step1, guardrail=validator, execution=WorkflowStepExecutionConfig(max_retries=3))
+            WorkflowStep(name="step1", handler=step1, guardrails=validator, execution=WorkflowStepExecutionConfig(max_retries=3))
         ])
         result = workflow.start("test")
         
@@ -1013,7 +1013,7 @@ class TestDocumentationExamples:
             return (False, "Please fix the output")
         
         workflow = Workflow(steps=[
-            WorkflowStep(name="gen", handler=generator, guardrail=validator, execution=WorkflowStepExecutionConfig(max_retries=3))
+            WorkflowStep(name="gen", handler=generator, guardrails=validator, execution=WorkflowStepExecutionConfig(max_retries=3))
         ])
         
         result = workflow.start("test")
@@ -1054,6 +1054,9 @@ class TestAgentWorkflows:
         class MockAgent:
             def __init__(self, name):
                 self.name = name
+                self._context_manager_initialized = True
+                self._context_param = None
+                self._context_manager = None
             
             def chat(self, message, **kwargs):
                 return f"Processed: {message}"
@@ -1072,6 +1075,9 @@ class TestAgentWorkflows:
             def __init__(self, name, prefix):
                 self.name = name
                 self.prefix = prefix
+                self._context_manager_initialized = True
+                self._context_param = None
+                self._context_manager = None
             
             def chat(self, message, **kwargs):
                 return f"{self.prefix}: {message}"
@@ -1119,6 +1125,9 @@ class TestAgentWorkflows:
             def __init__(self, name, output):
                 self.name = name
                 self.output = output
+                self._context_manager_initialized = True
+                self._context_param = None
+                self._context_manager = None
             
             def chat(self, message, **kwargs):
                 return self.output
@@ -1193,16 +1202,16 @@ class TestWorkflowConfiguration:
         """Test that workflow planning setting is stored."""
         def step1(ctx): return StepResult(output="Done")
         
-        workflow = Workflow(steps=[step1], planning=WorkflowPlanningConfig(enabled=True, llm="gpt-5-nano"))
+        workflow = Workflow(steps=[step1], planning=WorkflowPlanningConfig(enabled=True, llm="gpt-4o-mini"))
         assert workflow._planning_enabled == True
-        assert workflow.planning_llm == "gpt-5-nano"
+        assert workflow.planning_llm == "gpt-4o-mini"
     
     def test_workflow_default_llm(self):
         """Test default LLM setting."""
         def step1(ctx): return StepResult(output="Done")
         
-        workflow = Workflow(steps=[step1], default_llm="gpt-5-nano")
-        assert workflow.default_llm == "gpt-5-nano"
+        workflow = Workflow(steps=[step1], default_llm="gpt-4o-mini")
+        assert workflow.default_llm == "gpt-4o-mini"
     
     def test_workflow_default_agent_config(self):
         """Test default agent config."""
@@ -1392,10 +1401,10 @@ class TestPlanningAndReasoning:
         """Test that Workflow accepts planning parameter."""
         workflow = Workflow(
             steps=[lambda ctx: StepResult(output="test")],
-            planning=WorkflowPlanningConfig(enabled=True, llm="gpt-5-nano")
+            planning=WorkflowPlanningConfig(enabled=True, llm="gpt-4o-mini")
         )
         assert workflow._planning_enabled == True
-        assert workflow.planning_llm == "gpt-5-nano"
+        assert workflow.planning_llm == "gpt-4o-mini"
     
     def test_workflow_reasoning_parameter_exists(self):
         """Test that Workflow accepts reasoning parameter."""
@@ -1462,6 +1471,9 @@ class TestToolsPerStep:
             def __init__(self, name, tools=None):
                 self.name = name
                 self.tools = tools or []
+                self._context_manager_initialized = True
+                self._context_param = None
+                self._context_manager = None
             
             def chat(self, message, **kwargs):
                 return f"Response with {len(self.tools)} tools"

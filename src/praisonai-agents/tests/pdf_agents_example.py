@@ -7,8 +7,8 @@ pdf_agent = Agent(
     goal="Analyze PDF documents to extract meaningful information",
     backstory="""You are an expert in PDF document analysis and text extraction.
     You excel at understanding document structure, extracting content, and analyzing textual information.""",
-    llm="gpt-5-nano",
-    self_reflect=False
+    llm="gpt-4o-mini",
+    reflection=False
 )
 
 # 1. Task with PDF URL

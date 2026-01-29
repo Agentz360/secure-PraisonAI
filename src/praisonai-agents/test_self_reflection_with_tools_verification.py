@@ -26,7 +26,7 @@ def simple_calculator(operation: str, a: int, b: int) -> int:
 def test_llm_self_reflection_with_tools():
     """Test self-reflection in LLM class directly with tools"""
     print("=== Testing LLM Self-Reflection WITH Tools ===")
-    llm = LLM(model="gpt-5-nano")
+    llm = LLM(model="gpt-4o-mini")
     
     def mock_tool_executor(function_name, arguments):
         """Mock tool executor for testing"""
@@ -42,10 +42,10 @@ def test_llm_self_reflection_with_tools():
         prompt="Calculate 5 + 3 and then reflect on your answer",
         system_prompt="You are a helpful assistant with access to a calculator tool.",
         tools=[simple_calculator],
-        self_reflect=True,
+        reflection=True,
         min_reflect=1,
         max_reflect=2,
-        verbose=True,
+        output="verbose",
         execute_tool_fn=mock_tool_executor
     )
     print(f"LLM Response with tools: {response}")
@@ -54,15 +54,15 @@ def test_llm_self_reflection_with_tools():
 def test_llm_self_reflection_without_tools():
     """Test self-reflection in LLM class directly without tools"""
     print("=== Testing LLM Self-Reflection WITHOUT Tools ===")
-    llm = LLM(model="gpt-5-nano")
+    llm = LLM(model="gpt-4o-mini")
     
     response = llm.get_response(
         prompt="Calculate 5 + 3 and then reflect on your answer",
         system_prompt="You are a helpful assistant.",
-        self_reflect=True,
+        reflection=True,
         min_reflect=1,
         max_reflect=2,
-        verbose=True
+        output="verbose"
     )
     print(f"LLM Response without tools: {response}")
     print()
@@ -73,8 +73,8 @@ def test_agent_self_reflection_with_tools():
     agent = Agent(
         name="CalculatorAgent",
         instructions="You are a helpful assistant with access to a calculator tool.",
-        llm="gpt-5-nano",
-        self_reflect=True,
+        llm="gpt-4o-mini",
+        reflection=True,
         min_reflect=1,
         max_reflect=2,
         tools=[simple_calculator]
@@ -90,8 +90,8 @@ def test_agent_self_reflection_without_tools():
     agent = Agent(
         name="BasicAgent",
         instructions="You are a helpful assistant.",
-        llm="gpt-5-nano",
-        self_reflect=True,
+        llm="gpt-4o-mini",
+        reflection=True,
         min_reflect=1,
         max_reflect=2
     )

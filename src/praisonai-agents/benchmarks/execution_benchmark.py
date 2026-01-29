@@ -52,12 +52,11 @@ def benchmark_praisonai(model, iterations, prompt):
         agent = Agent(
             name="Calculator",
             instructions="You are a helpful assistant. Be very brief.",
-            llm=model,
-            verbose=False
+            llm=model
         )
         
         start = time.perf_counter()
-        response = agent.start(prompt)
+        response = agent.start(prompt, output="silent")
         elapsed = time.perf_counter() - start
         
         times.append(elapsed)
@@ -80,12 +79,11 @@ def benchmark_praisonai_litellm(model, iterations, prompt):
         agent = Agent(
             name="Calculator",
             instructions="You are a helpful assistant. Be very brief.",
-            llm=f"openai/{model}",
-            verbose=False
+            llm=f"openai/{model}"
         )
         
         start = time.perf_counter()
-        response = agent.start(prompt)
+        response = agent.start(prompt, output="silent")
         elapsed = time.perf_counter() - start
         
         times.append(elapsed)
@@ -221,7 +219,7 @@ def save_results(results: dict, model: str, iterations: int, prompt: str):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PraisonAI Agents - Real Execution Benchmark')
-    parser.add_argument('--no-save', action='store_true', help='Do not save results to file')
+    parser.add_argument('--save', action='store_true', help='Save results to file')
     parser.add_argument('--model', '-m', type=str, default=DEFAULT_MODEL, help=f'Model to use (default: {DEFAULT_MODEL})')
     parser.add_argument('--iterations', '-i', type=int, default=DEFAULT_ITERATIONS, help=f'Number of iterations (default: {DEFAULT_ITERATIONS})')
     parser.add_argument('--prompt', '-p', type=str, default=DEFAULT_PROMPT, help=f'Prompt to use (default: "{DEFAULT_PROMPT}")')
@@ -289,8 +287,8 @@ if __name__ == '__main__':
     
     print('\n' + '=' * 60)
     
-    # Save results (unless --no-save)
-    if results and not args.no_save:
+    # Save results (if --save)
+    if results and args.save:
         save_results(results, model, iterations, prompt)
-    elif args.no_save:
-        print('\nResults not saved (--no-save flag used)')
+    elif not args.save:
+        print('\nResults not saved (use --save flag to save results to file)')

@@ -214,6 +214,9 @@ class OptimizationResult:
     messages_removed: int = 0
     messages_tagged: int = 0
     tool_outputs_pruned: int = 0
+    tool_outputs_summarized: int = 0  # Count of tool outputs summarized via LLM
+    tokens_saved_by_summarization: int = 0  # Tokens saved specifically by LLM summarization
+    tokens_saved_by_truncation: int = 0  # Tokens saved specifically by truncation
     summary_added: bool = False
     
     @property
@@ -245,6 +248,20 @@ class ContextConfig:
     Complete context management configuration.
     
     Merges settings from CLI flags, env vars, and config files.
+    
+    Example:
+        # Enable with defaults
+        agent = Agent(instructions="...", context=True)
+        
+        # Custom configuration
+        agent = Agent(
+            instructions="...",
+            context=ContextConfig(
+                auto_compact=True,
+                session_tracking=True,      # Track goal/plan/progress
+                aggregate_memory=True,       # Concurrent multi-memory fetch
+            )
+        )
     """
     # Auto-compaction
     auto_compact: bool = True
@@ -260,17 +277,67 @@ class ContextConfig:
     prune_after_tokens: int = 40000
     protected_tools: List[str] = field(default_factory=list)
     
+    # Per-tool output limits (tool_name -> max_chars)
+    tool_limits: Dict[str, int] = field(default_factory=dict)
+    
     # Monitoring
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     
     # Sliding window
     keep_recent_turns: int = 5
     
+    # LLM-powered summarization
+    llm_summarize: bool = False  # Enable LLM-powered summarization (uses agent's LLM)
+    
+    # Smart tool output summarization (summarize before truncating)
+    smart_tool_summarize: bool = True  # Summarize large tool outputs using LLM before truncating
+    
+    # Session tracking (Agno pattern)
+    session_tracking: bool = False     # Enable goal/plan/progress tracking
+    track_summary: bool = True         # Auto-extract conversation summary
+    track_goal: bool = True            # Track user's objective
+    track_plan: bool = True            # Track steps to achieve goal
+    track_progress: bool = True        # Track completed steps
+    
+    # Multi-memory aggregation (CrewAI pattern)
+    aggregate_memory: bool = False     # Enable concurrent multi-source fetch
+    aggregate_sources: List[str] = field(default_factory=lambda: [
+        "memory",      # Short-term memory
+        "knowledge",   # Long-term knowledge base
+        "rag",         # RAG retrieval
+    ])
+    aggregate_max_tokens: int = 4000   # Max tokens for aggregated context
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         result = asdict(self)
         result['strategy'] = self.strategy.value
         return result
+    
+    @classmethod
+    def for_recipe(cls) -> "ContextConfig":
+        """
+        Preset for recipe/workflow use cases with many tool calls.
+        
+        Optimized for:
+        - Preventing context overflow in multi-step workflows
+        - Preserving important tool outputs
+        - Triggering compaction earlier (70% vs 80%)
+        - Limiting tool outputs to prevent explosion
+        
+        Returns:
+            ContextConfig with recipe-optimized settings
+        """
+        return cls(
+            auto_compact=True,
+            compact_threshold=0.7,  # Trigger at 70% (earlier than default 80%)
+            strategy=OptimizerStrategy.SMART,
+            tool_output_max=2000,  # Limit each tool output to ~2000 tokens
+            keep_recent_turns=3,   # Keep last 3 turns intact
+            prune_after_tokens=50000,  # Start pruning after 50K tokens
+            output_reserve=8000,
+            history_ratio=0.6,
+        )
 
 
 @runtime_checkable

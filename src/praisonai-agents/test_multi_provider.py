@@ -58,9 +58,9 @@ def test_router_agent():
         name="Test Agent",
         role="Test Assistant",
         goal="Test multi-model functionality",
-        models=["gpt-5-nano"],  # Using single model for testing
+        models=["gpt-4o-mini"],  # Using single model for testing
         routing_strategy="auto",
-        verbose=False
+        output="silent"
     )
     
     print(f"Agent created: {agent.name}")
@@ -86,9 +86,9 @@ def test_integration():
         name="Integration Test Agent",
         role="Tester",
         goal="Test the integration",
-        models=["gpt-5-nano"],  # Single model for testing
+        models=["gpt-4o-mini"],  # Single model for testing
         routing_strategy="manual",  # Use manual to avoid complexity
-        verbose=False
+        output="silent"
     )
     
     # Create a simple task
@@ -104,7 +104,7 @@ def test_integration():
         agents=[agent],
         tasks=[task],
         process="sequential",
-        verbose=False
+        output="silent"
     )
     
     print("Created Agents with RouterAgent")

@@ -176,8 +176,8 @@ def run(
     config = config or {}
     input = input or {}
     
-    # Generate identifiers
-    run_id = _generate_run_id()
+    # Generate identifiers - use custom trace_name if provided
+    run_id = options.get("trace_name") or _generate_run_id()
     trace_id = _generate_trace_id()
     session_id = session_id or f"session-{uuid.uuid4().hex[:8]}"
     
@@ -188,6 +188,27 @@ def run(
         "trace_id": trace_id,
         "session_id": session_id,
     }
+    
+    # Initialize replay trace writer if --save flag is set
+    trace_writer = None
+    trace_emitter = None
+    trace_emitter_token = None  # Token for resetting global emitter
+    if options.get("save_replay", False):
+        try:
+            from praisonai.replay import ContextTraceWriter
+            from praisonaiagents.trace.context_events import ContextTraceEmitter, set_context_emitter
+            trace_writer = ContextTraceWriter(session_id=run_id)
+            trace_emitter = ContextTraceEmitter(sink=trace_writer, session_id=run_id, full_content=True)
+            # Set as global emitter so agents can access it
+            trace_emitter_token = set_context_emitter(trace_emitter)
+            trace_emitter.session_start({"recipe": name, "run_id": run_id})
+            print(f"📝 Replay trace enabled: {run_id}")
+        except ImportError as e:
+            import logging
+            logging.debug(f"Replay module not available: {e}")
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to initialize trace writer: {e}")
     
     try:
         # Load template
@@ -235,6 +256,11 @@ def run(
         
         # Dry run mode
         if options.get("dry_run", False):
+            # Close trace writer for dry-run
+            if trace_emitter:
+                trace_emitter.session_end()
+            if trace_writer:
+                trace_writer.close()
             return RecipeResult(
                 run_id=run_id,
                 recipe=recipe_config.name,
@@ -249,21 +275,43 @@ def run(
                 trace=trace,
             )
         
-        # Merge input and config
-        if isinstance(input, str):
-            merged_config = {**recipe_config.defaults, "input": input, **config}
-        else:
-            merged_config = {**recipe_config.defaults, **input, **config}
+        # Merge input and config with built-in variables
+        # Add built-in template variables that should always be resolved
+        builtin_vars = {
+            "today": datetime.now().strftime("%B %d, %Y"),  # e.g., "January 24, 2026"
+            "date": datetime.now().strftime("%Y-%m-%d"),     # e.g., "2026-01-24"
+            "time": datetime.now().strftime("%H:%M:%S"),     # e.g., "14:30:00"
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "year": datetime.now().strftime("%Y"),
+            "month": datetime.now().strftime("%B"),
+        }
         
-        # Execute recipe
+        if isinstance(input, str):
+            merged_config = {**builtin_vars, **recipe_config.defaults, "input": input, **config}
+        else:
+            merged_config = {**builtin_vars, **recipe_config.defaults, **input, **config}
+        
+        # Execute recipe (pass trace_emitter for event tracking)
         output = _execute_recipe(
             recipe_config,
             merged_config,
             session_id,
             options,
+            trace_emitter=trace_emitter,
         )
         
         duration = time.time() - start_time
+        
+        # Close trace writer on success
+        if trace_emitter:
+            trace_emitter.session_end()
+        if trace_writer:
+            trace_writer.close()
+            print(f"📝 Replay trace saved: {run_id}")
+        # Reset global emitter
+        if trace_emitter_token:
+            from praisonaiagents.trace.context_events import reset_context_emitter
+            reset_context_emitter(trace_emitter_token)
         
         return RecipeResult(
             run_id=run_id,
@@ -276,6 +324,13 @@ def run(
         )
         
     except RecipeNotFoundError as e:
+        if trace_emitter:
+            trace_emitter.session_end()
+        if trace_writer:
+            trace_writer.close()
+        if trace_emitter_token:
+            from praisonaiagents.trace.context_events import reset_context_emitter
+            reset_context_emitter(trace_emitter_token)
         return RecipeResult(
             run_id=run_id,
             recipe=name,
@@ -286,6 +341,13 @@ def run(
             trace=trace,
         )
     except RecipeDependencyError as e:
+        if trace_emitter:
+            trace_emitter.session_end()
+        if trace_writer:
+            trace_writer.close()
+        if trace_emitter_token:
+            from praisonaiagents.trace.context_events import reset_context_emitter
+            reset_context_emitter(trace_emitter_token)
         return RecipeResult(
             run_id=run_id,
             recipe=e.recipe or name,
@@ -296,6 +358,13 @@ def run(
             trace=trace,
         )
     except RecipePolicyError as e:
+        if trace_emitter:
+            trace_emitter.session_end()
+        if trace_writer:
+            trace_writer.close()
+        if trace_emitter_token:
+            from praisonaiagents.trace.context_events import reset_context_emitter
+            reset_context_emitter(trace_emitter_token)
         return RecipeResult(
             run_id=run_id,
             recipe=e.recipe or name,
@@ -306,6 +375,13 @@ def run(
             trace=trace,
         )
     except RecipeTimeoutError as e:
+        if trace_emitter:
+            trace_emitter.session_end()
+        if trace_writer:
+            trace_writer.close()
+        if trace_emitter_token:
+            from praisonaiagents.trace.context_events import reset_context_emitter
+            reset_context_emitter(trace_emitter_token)
         return RecipeResult(
             run_id=run_id,
             recipe=name,
@@ -316,6 +392,13 @@ def run(
             trace=trace,
         )
     except Exception as e:
+        if trace_emitter:
+            trace_emitter.session_end()
+        if trace_writer:
+            trace_writer.close()
+        if trace_emitter_token:
+            from praisonaiagents.trace.context_events import reset_context_emitter
+            reset_context_emitter(trace_emitter_token)
         return RecipeResult(
             run_id=run_id,
             recipe=name,
@@ -601,9 +684,38 @@ def describe(name: str, offline: bool = False) -> Optional[RecipeConfig]:
 # --- Internal Functions ---
 
 def _load_recipe(name: str, offline: bool = False) -> Optional[RecipeConfig]:
-    """Load a recipe by name or URI."""
+    """Load a recipe by name or URI or path."""
     try:
         from praisonai.templates import TemplateDiscovery, TemplateLoader
+        
+        # Check if name is an absolute path to a recipe directory
+        name_path = Path(name)
+        if name_path.is_absolute() and name_path.exists() and name_path.is_dir():
+            # Check for agents.yaml or TEMPLATE.yaml in the directory
+            agents_yaml = name_path / "agents.yaml"
+            template_yaml = name_path / "TEMPLATE.yaml"
+            
+            if agents_yaml.exists() or template_yaml.exists():
+                loader = TemplateLoader(offline=offline)
+                template = loader.load(str(name_path))
+                
+                return RecipeConfig(
+                    name=template.name,
+                    version=template.version,
+                    description=template.description,
+                    author=template.author,
+                    license=template.license,
+                    tags=template.tags,
+                    requires=template.requires,
+                    tools=template.raw.get("tools", {}),
+                    config_schema=template.config_schema,
+                    defaults=template.defaults,
+                    outputs=template.raw.get("outputs", []),
+                    governance=template.raw.get("governance", {}),
+                    data_policy=template.raw.get("data_policy", {}),
+                    path=str(template.path) if template.path else None,
+                    raw=template.raw,
+                )
         
         discovery = TemplateDiscovery()
         discovered = discovery.find_template(name)
@@ -660,6 +772,43 @@ def _load_recipe(name: str, offline: bool = False) -> Optional[RecipeConfig]:
         return None
 
 
+def _check_package_installed(package_name: str) -> bool:
+    """
+    Check if a Python package is installed using importlib.metadata.
+    
+    This is more reliable than trying to import the package because:
+    1. Package names often differ from import names (e.g., tavily-python -> tavily)
+    2. importlib.metadata checks the actual installed packages
+    3. No side effects from importing modules
+    
+    Args:
+        package_name: The pip package name (e.g., 'tavily-python', 'pillow')
+        
+    Returns:
+        True if package is installed, False otherwise
+    """
+    try:
+        from importlib.metadata import distributions
+        
+        # Normalize package name for comparison (pip normalizes - and _ and case)
+        normalized = package_name.lower().replace("-", "_").replace(".", "_")
+        
+        for dist in distributions():
+            dist_name = dist.metadata.get("Name", "").lower().replace("-", "_").replace(".", "_")
+            if dist_name == normalized:
+                return True
+        
+        return False
+    except Exception:
+        # Fallback: try to import with common name transformations
+        try:
+            import_name = package_name.replace("-", "_")
+            __import__(import_name)
+            return True
+        except ImportError:
+            return False
+
+
 def _check_dependencies(recipe_config: RecipeConfig) -> Dict[str, Any]:
     """Check if recipe dependencies are satisfied."""
     result = {
@@ -672,11 +821,9 @@ def _check_dependencies(recipe_config: RecipeConfig) -> Dict[str, Any]:
     
     # Check Python packages
     for pkg in recipe_config.get_required_packages():
-        try:
-            __import__(pkg.replace("-", "_"))
-            result["packages"].append({"name": pkg, "available": True})
-        except ImportError:
-            result["packages"].append({"name": pkg, "available": False})
+        available = _check_package_installed(pkg)
+        result["packages"].append({"name": pkg, "available": available})
+        if not available:
             result["all_satisfied"] = False
     
     # Check environment variables
@@ -736,6 +883,7 @@ def _execute_recipe(
     merged_config: Dict[str, Any],
     session_id: str,
     options: Dict[str, Any],
+    trace_emitter: Any = None,
 ) -> Any:
     """Execute the recipe workflow."""
     try:
@@ -750,6 +898,21 @@ def _execute_recipe(
         # Create a TemplateConfig compatible with loader
         template_path = Path(recipe_config.path) if recipe_config.path else None
         
+        # Determine workflow file - check for agents.yaml if workflow.yaml not specified
+        workflow_raw = recipe_config.raw.get("workflow", "workflow.yaml")
+        agents_raw = recipe_config.raw.get("agents", "agents.yaml")
+        
+        # Handle case where "workflow" or "agents" is a dict (inline definition) vs string (file path)
+        workflow_file = workflow_raw if isinstance(workflow_raw, str) else "workflow.yaml"
+        agents_file = "agents.yaml"  # Always use agents.yaml as the file path
+        
+        # If workflow.yaml doesn't exist but agents.yaml does, use agents.yaml as workflow
+        if template_path:
+            workflow_path = template_path / workflow_file
+            agents_path = template_path / agents_file
+            if not workflow_path.exists() and agents_path.exists():
+                workflow_file = agents_file
+        
         loader_config = LoaderTemplateConfig(
             name=recipe_config.name,
             description=recipe_config.description,
@@ -758,8 +921,8 @@ def _execute_recipe(
             license=recipe_config.license,
             tags=recipe_config.tags,
             requires=recipe_config.requires,
-            workflow_file=recipe_config.raw.get("workflow", "workflow.yaml"),
-            agents_file=recipe_config.raw.get("agents", "agents.yaml"),
+            workflow_file=workflow_file,
+            agents_file=agents_file,
             config_schema=recipe_config.config_schema,
             defaults=merged_config,
             skills=recipe_config.raw.get("skills", []),
@@ -782,6 +945,9 @@ def _execute_recipe(
                 workflow_config, merged_config, tool_registry, options
             )
         elif "steps" in workflow_config:
+            # Pass the workflow file path for proper execution
+            workflow_file_path = template_path / workflow_file if template_path else None
+            merged_config["_workflow_file"] = str(workflow_file_path) if workflow_file_path else None
             return _execute_steps_workflow(
                 workflow_config, merged_config, tool_registry, options
             )
@@ -810,11 +976,26 @@ def _execute_praisonai_workflow(
     agents = []
     agent_map = {}
     
-    for agent_cfg in workflow_config.get("agents", []):
+    agents_cfg = workflow_config.get("agents", [])
+    if isinstance(agents_cfg, dict):
+        # Convert dict of agents to list of dicts, including the key as 'name'
+        agents_list = []
+        for name, cfg in agents_cfg.items():
+            if isinstance(cfg, dict):
+                cfg["name"] = cfg.get("name", name)
+                agents_list.append(cfg)
+        agents_cfg = agents_list
+    
+    for agent_cfg in agents_cfg:
         agent_tools = resolve_tools(
             agent_cfg.get("tools", []),
             registry=tool_registry,
         )
+        
+        # Use output= instead of verbose= (DRY: same as Workflow)
+        output_mode = options.get("output")
+        if not output_mode and options.get("verbose"):
+            output_mode = "verbose"
         
         agent = Agent(
             name=agent_cfg.get("name", "Agent"),
@@ -823,7 +1004,7 @@ def _execute_praisonai_workflow(
             backstory=agent_cfg.get("backstory", ""),
             tools=agent_tools if agent_tools else None,
             llm=agent_cfg.get("llm"),
-            verbose=options.get("verbose", False),
+            output=output_mode,  # Use output= instead of deprecated verbose=
         )
         agents.append(agent)
         agent_map[agent_cfg.get("name")] = agent
@@ -848,11 +1029,15 @@ def _execute_praisonai_workflow(
         )
         tasks.append(task)
     
+    # Use output mode for Agents as well (DRY approach)
+    output_mode = options.get("output")
+    if not output_mode and options.get("verbose"):
+        output_mode = "verbose"
+    
     praison = Agents(
         agents=agents,
         tasks=tasks,
         process=workflow_config.get("process", "sequential"),
-        verbose=options.get("verbose", 1) if options.get("verbose") else 0,
     )
     
     return praison.start()
@@ -864,9 +1049,45 @@ def _execute_steps_workflow(
     tool_registry: Any,
     options: Dict[str, Any],
 ) -> Any:
-    """Execute a steps-based workflow."""
-    # For now, convert to simple execution
-    return {"message": "Steps workflow executed", "config": config}
+    """
+    Execute a steps-based workflow using praisonaiagents Workflow.
+    
+    This properly executes the workflow with all features:
+    - include steps (modular recipes)
+    - loop steps (parallel/sequential)
+    - output_variable
+    - agent execution
+    - CLI variable overrides via --var
+    """
+    from praisonaiagents.workflows import YAMLWorkflowParser
+    
+    # Get the workflow file path from config if available
+    workflow_file = config.get("_workflow_file")
+    
+    # Extract CLI variable overrides (everything except internal keys)
+    extra_vars = {k: v for k, v in config.items() if not k.startswith("_")}
+    
+    if workflow_file:
+        # Use YAMLWorkflowParser to properly parse and execute the workflow
+        # This handles include steps, loops, variables, tools, etc.
+        parser = YAMLWorkflowParser(tool_registry=tool_registry)
+        workflow = parser.parse_file(workflow_file, extra_vars=extra_vars)
+        return workflow.start()
+    
+    # Fallback: Create workflow from config dict using parser
+    from praisonaiagents import Workflow
+    
+    # Merge YAML variables with CLI overrides (CLI takes precedence)
+    yaml_vars = workflow_config.get("variables", {})
+    merged_vars = {**yaml_vars, **extra_vars}
+    
+    workflow = Workflow(
+        name=workflow_config.get("name", "RecipeWorkflow"),
+        steps=workflow_config.get("steps", []),
+        variables=merged_vars,
+    )
+    return workflow.start()
+
 
 
 def _execute_simple_agent(
@@ -878,12 +1099,17 @@ def _execute_simple_agent(
     """Execute a simple single-agent workflow."""
     from praisonaiagents import Agent
     
+    # Use output= instead of verbose= (DRY: same as Workflow)
+    output_mode = options.get("output")
+    if not output_mode and options.get("verbose"):
+        output_mode = "verbose"
+    
     agent = Agent(
         name=workflow_config.get("name", "RecipeAgent"),
         role=workflow_config.get("role", "AI Assistant"),
         goal=workflow_config.get("goal", "Complete the task"),
         backstory=workflow_config.get("backstory", ""),
-        verbose=options.get("verbose", False),
+        output=output_mode,  # Use output= instead of deprecated verbose=
     )
     
     prompt = config.get("input", config.get("prompt", ""))

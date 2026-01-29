@@ -11,6 +11,7 @@ Usage:
 import time
 from typing import Literal
 from importlib.metadata import version as get_version
+import argparse
 
 
 ITERATIONS = 100
@@ -57,11 +58,11 @@ def run_benchmark():
     from praisonaiagents import Agent as PraisonAgent
     
     results['PraisonAI'] = measure_instantiation(
-        lambda: PraisonAgent(name='Test', llm='gpt-4o-mini', tools=tools, verbose=False)
+        lambda: PraisonAgent(name='Test', llm='gpt-4o-mini', tools=tools, output="silent")
     )
     
     results['PraisonAI (LiteLLM)'] = measure_instantiation(
-        lambda: PraisonAgent(name='Test', llm='openai/gpt-4o-mini', tools=tools, verbose=False)
+        lambda: PraisonAgent(name='Test', llm='openai/gpt-4o-mini', tools=tools, output="silent")
     )
     
     # Other frameworks with tools
@@ -209,5 +210,13 @@ def save_results(results: dict, filename: str = 'TOOLS_BENCHMARK_RESULTS.md'):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='PraisonAI Agents - Tools Benchmark')
+    parser.add_argument('--save', action='store_true', help='Save results to file')
+    args = parser.parse_args()
+    
     results = run_benchmark()
-    save_results(results)
+    
+    if args.save:
+        save_results(results)
+    else:
+        print('\nResults not saved (use --save flag to save results to file)')

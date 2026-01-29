@@ -672,16 +672,16 @@ class TestPlanningAgent:
         
         planner = PlanningAgent()
         
-        assert planner.llm_model in ["gpt-4o-mini", "gpt-5-nano"]
+        assert planner.llm_model in ["gpt-4o-mini", "gpt-4o-mini"]
         assert planner.read_only is True
         
     def test_planning_agent_custom_llm(self):
         """Test PlanningAgent with custom LLM."""
         from praisonaiagents.planning import PlanningAgent
         
-        planner = PlanningAgent(llm="gpt-5-nano")
+        planner = PlanningAgent(llm="gpt-4o-mini")
         
-        assert planner.llm_model == "gpt-5-nano"
+        assert planner.llm_model == "gpt-4o-mini"
         
     def test_planning_agent_allowed_tools(self):
         """Test PlanningAgent has only read-only tools."""
@@ -836,14 +836,14 @@ class TestAgentsPlanningIntegration:
         agent = Agent(name="Test", role="Tester")
         task = Task(description="Test task", agent=agent)
         
+        from praisonaiagents.config import MultiAgentPlanningConfig
         agents = Agents(
             agents=[agent],
             tasks=[task],
-            planning=True,
-            planning_llm="gpt-5-nano"
+            planning=MultiAgentPlanningConfig(llm="gpt-4o-mini")
         )
         
-        assert agents.planning_llm == "gpt-5-nano"
+        assert agents.planning_llm == "gpt-4o-mini"
         
     def test_agents_auto_approve_plan(self):
         """Test auto-approve plan option."""
@@ -852,11 +852,11 @@ class TestAgentsPlanningIntegration:
         agent = Agent(name="Test", role="Tester")
         task = Task(description="Test task", agent=agent)
         
+        from praisonaiagents.config import MultiAgentPlanningConfig
         agents = Agents(
             agents=[agent],
             tasks=[task],
-            planning=True,
-            auto_approve_plan=True
+            planning=MultiAgentPlanningConfig(auto_approve=True)
         )
         
         assert agents.auto_approve_plan is True
@@ -867,20 +867,21 @@ class TestAgentsPlanningIntegration:
         from praisonaiagents import Agent, Task, Agents
         from praisonaiagents.planning import Plan, PlanStep
         
-        agent = Agent(name="Test", role="Tester", llm="gpt-5-nano")
+        agent = Agent(name="Test", role="Tester", llm="gpt-4o-mini")
         task = Task(description="Test task", agent=agent)
         
+        from praisonaiagents.config import MultiAgentPlanningConfig
         agents = Agents(
             agents=[agent],
             tasks=[task],
-            planning=True,
-            auto_approve_plan=True
+            planning=MultiAgentPlanningConfig(auto_approve=True)
         )
         
         # Test that planning is enabled and configured correctly
-        assert agents.planning is True
+        assert agents.planning is not None  # Planning config is set
         assert agents.auto_approve_plan is True
-        assert agents.planning_llm == "gpt-5-nano"
+        # Default planning_llm is gpt-4o-mini
+        assert agents.planning_llm == "gpt-4o-mini"
         assert agents._current_plan is None  # No plan created yet
         assert agents._todo_list is None
                 
@@ -934,16 +935,18 @@ class TestReadOnlyMode:
         assert agent.plan_mode is False
         
     def test_agent_plan_mode_enabled(self):
-        """Test enabling plan_mode."""
+        """Test enabling plan_mode via PlanningConfig."""
         from praisonaiagents import Agent
+        from praisonaiagents.config import PlanningConfig
         
-        agent = Agent(name="Test", role="Tester", plan_mode=True)
+        agent = Agent(name="Test", role="Tester", planning=PlanningConfig(read_only=True))
         
         assert agent.plan_mode is True
         
     def test_agent_read_only_tools_filter(self):
         """Test that plan_mode filters to read-only tools."""
         from praisonaiagents import Agent
+        from praisonaiagents.config import PlanningConfig
         from praisonaiagents.planning import READ_ONLY_TOOLS
         
         def read_file(path: str) -> str:
@@ -958,7 +961,7 @@ class TestReadOnlyMode:
             name="Test",
             role="Tester",
             tools=[read_file, write_file],
-            plan_mode=True
+            planning=PlanningConfig(read_only=True)
         )
         
         available = agent.get_available_tools()

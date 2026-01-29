@@ -11,7 +11,8 @@ Shows how to monitor agent performance when using external tools.
 """
 
 from praisonaiagents import Agent
-from praisonaiagents.tools import duckduckgo, wikipedia
+from praisonaiagents import duckduckgo
+from praisonai_tools import wikipedia_tools
 from praisonaiagents.telemetry import (
     monitor_function, track_api_call, get_api_stats,
     get_slowest_functions, performance_monitor
@@ -48,8 +49,8 @@ def main():
         instructions="""You are a research assistant that helps find information.
         Use the available tools to search for information and provide comprehensive answers.
         Be thorough in your research and cite your sources.""",
-        llm="gpt-5-nano",
-        tools=[duckduckgo, wikipedia]  # Add search tools
+        llm="gpt-4o-mini",
+        tools=[duckduckgo, wikipedia_tools]  # Add search tools
     )
     
     # Test queries to demonstrate tool performance monitoring
@@ -97,7 +98,9 @@ def main():
     # Slowest functions analysis
     print("\n🐌 Slowest Functions:")
     slowest = get_slowest_functions()
-    for func_name, avg_time in slowest:
+    for item in slowest[:5]:
+        func_name = item.get('function', 'unknown')
+        avg_time = item.get('average_time', 0)
         print(f"  {func_name}: {avg_time:.3f}s average")
     
     # Real-time performance data

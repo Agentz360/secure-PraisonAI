@@ -10,6 +10,7 @@ Usage:
 
 import time
 from typing import Literal
+import argparse
 
 
 ITERATIONS = 100
@@ -47,11 +48,11 @@ def run_benchmark():
     from praisonaiagents import Agent as PraisonAgent
     
     results['PraisonAI'] = measure_instantiation(
-        lambda: PraisonAgent(name='Test', llm='gpt-4o-mini', verbose=False)
+        lambda: PraisonAgent(name='Test', llm='gpt-4o-mini', output="silent")
     )
     
     results['PraisonAI (LiteLLM)'] = measure_instantiation(
-        lambda: PraisonAgent(name='Test', llm='openai/gpt-4o-mini', verbose=False)
+        lambda: PraisonAgent(name='Test', llm='openai/gpt-4o-mini', output="silent")
     )
     
     # Other frameworks for comparison
@@ -239,5 +240,13 @@ def update_readme(readme_path: str, table_rows: list):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='PraisonAI Agents - Performance Benchmark')
+    parser.add_argument('--save', action='store_true', help='Save results to file')
+    args = parser.parse_args()
+    
     results = run_benchmark()
-    save_results(results)
+    
+    if args.save:
+        save_results(results)
+    else:
+        print('\nResults not saved (use --save flag to save results to file)')

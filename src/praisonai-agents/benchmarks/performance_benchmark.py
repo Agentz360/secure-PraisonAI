@@ -14,6 +14,7 @@ import tracemalloc
 import statistics
 from typing import Literal, List, Callable
 from dataclasses import dataclass, field
+import argparse
 
 
 @dataclass
@@ -186,7 +187,7 @@ def instantiate_praisonai_agent():
         instructions="Be concise, reply with one sentence.",
         llm="gpt-4o-mini",
         tools=tools,
-        verbose=False
+        output="silent"
     )
 
 
@@ -197,7 +198,7 @@ def instantiate_praisonai_litellm_agent():
         instructions="Be concise, reply with one sentence.",
         llm="openai/gpt-4o-mini",
         tools=tools,
-        verbose=False
+        output="silent"
     )
 
 
@@ -364,6 +365,10 @@ def save_benchmark_results(results: dict, baseline):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='PraisonAI Agents - Comprehensive Performance Benchmark')
+    parser.add_argument('--save', action='store_true', help='Save results to file')
+    args = parser.parse_args()
+    
     print("="*70)
     print("PraisonAI Agents - Comprehensive Performance Benchmark")
     print("="*70)
@@ -520,4 +525,7 @@ if __name__ == "__main__":
         print("\n" + "="*70)
         
         # Save results to files
-        save_benchmark_results(results, baseline)
+        if args.save:
+            save_benchmark_results(results, baseline)
+        else:
+            print('\nResults not saved (use --save flag to save results to file)')

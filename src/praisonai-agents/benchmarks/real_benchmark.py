@@ -15,6 +15,7 @@ import os
 from typing import Literal, List
 from dataclasses import dataclass, field
 from importlib.metadata import version as get_version
+import argparse
 
 # Ensure API key is set
 if not os.environ.get('OPENAI_API_KEY'):
@@ -103,12 +104,11 @@ def benchmark_praisonai_single(iterations: int = 3) -> ExecutionResult:
             name="Assistant",
             instructions="You are a helpful assistant. Be very brief.",
             llm="gpt-4o-mini",
-            tools=[get_weather],
-            verbose=False
+            tools=[get_weather]
         )
         
         start = time.perf_counter()
-        response = agent.start("What's the weather in NYC? Reply in one sentence.")
+        response = agent.start("What's the weather in NYC? Reply in one sentence.", output="silent")
         elapsed = time.perf_counter() - start
         
         result.times.append(elapsed)
@@ -132,8 +132,7 @@ def benchmark_praisonai_two_agents(iterations: int = 3) -> ExecutionResult:
             goal="Gather weather information",
             instructions="Get weather data and pass to reporter. Be brief.",
             llm="gpt-4o-mini",
-            tools=[get_weather],
-            verbose=False
+            tools=[get_weather]
         )
         
         reporter = Agent(
@@ -141,18 +140,16 @@ def benchmark_praisonai_two_agents(iterations: int = 3) -> ExecutionResult:
             role="News Reporter",
             goal="Create weather report",
             instructions="Create a one-sentence weather summary.",
-            llm="gpt-4o-mini",
-            verbose=False
+            llm="gpt-4o-mini"
         )
         
         agents = Agents(
             agents=[researcher, reporter],
-            process="sequential",
-            verbose=False
+            process="sequential"
         )
         
         start = time.perf_counter()
-        response = agents.start("Get NYC weather and create a brief report.")
+        response = agents.start("Get NYC weather and create a brief report.", output="silent")
         elapsed = time.perf_counter() - start
         
         result.times.append(elapsed)
@@ -176,8 +173,7 @@ def benchmark_praisonai_three_agents(iterations: int = 3) -> ExecutionResult:
             goal="Get weather data",
             instructions="Fetch weather information. Be brief.",
             llm="gpt-4o-mini",
-            tools=[get_weather],
-            verbose=False
+            tools=[get_weather]
         )
         
         time_agent = Agent(
@@ -186,8 +182,7 @@ def benchmark_praisonai_three_agents(iterations: int = 3) -> ExecutionResult:
             goal="Get time information",
             instructions="Fetch timezone information. Be brief.",
             llm="gpt-4o-mini",
-            tools=[get_time],
-            verbose=False
+            tools=[get_time]
         )
         
         summarizer = Agent(
@@ -195,18 +190,16 @@ def benchmark_praisonai_three_agents(iterations: int = 3) -> ExecutionResult:
             role="Summary Writer",
             goal="Combine information",
             instructions="Create a one-sentence summary combining weather and time.",
-            llm="gpt-4o-mini",
-            verbose=False
+            llm="gpt-4o-mini"
         )
         
         agents = Agents(
             agents=[weather_agent, time_agent, summarizer],
-            process="sequential",
-            verbose=False
+            process="sequential"
         )
         
         start = time.perf_counter()
-        response = agents.start("Get NYC weather and EST time, then summarize.")
+        response = agents.start("Get NYC weather and EST time, then summarize.", output="silent")
         elapsed = time.perf_counter() - start
         
         result.times.append(elapsed)
@@ -400,6 +393,10 @@ def save_results(results: dict, versions: dict):
 # ============================================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='PraisonAI Agents - Real-World Execution Benchmark')
+    parser.add_argument('--save', action='store_true', help='Save results to file')
+    args = parser.parse_args()
+    
     print("="*70)
     print("PraisonAI Agents - Real-World Execution Benchmark")
     print("="*70)
@@ -478,4 +475,7 @@ if __name__ == "__main__":
     print("\n" + "="*70)
     
     # Save results
-    save_results(results, versions)
+    if args.save:
+        save_results(results, versions)
+    else:
+        print('\nResults not saved (use --save flag to save results to file)')

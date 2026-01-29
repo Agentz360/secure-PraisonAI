@@ -35,9 +35,9 @@ def test_self_reflection_with_tools():
         role="Senior Research Analyst",
         goal="Analyze and provide insights on given topics",
         backstory="You are an expert analyst with strong critical thinking skills",
-        self_reflect=True,
-        llm="gpt-5-nano",  # Using OpenAI model for testing
-        verbose=True,
+        reflection=True,
+        llm="gpt-4o-mini",  # Using OpenAI model for testing
+        output="verbose",
         tools=[mock_tool],
         max_reflect=2,  # Keep it small for testing
         min_reflect=1
@@ -75,9 +75,9 @@ def test_self_reflection_without_tools():
         role="Senior Research Analyst",
         goal="Analyze and provide insights on given topics",
         backstory="You are an expert analyst with strong critical thinking skills",
-        self_reflect=True,
-        llm="gpt-5-nano",  # Using OpenAI model for testing
-        verbose=True,
+        reflection=True,
+        llm="gpt-4o-mini",  # Using OpenAI model for testing
+        output="verbose",
         max_reflect=2,  # Keep it small for testing
         min_reflect=1
     )
@@ -115,7 +115,7 @@ def test_llm_directly():
     mock_tool = create_mock_tool()
     
     # Create LLM instance
-    llm = LLM(model="gpt-5-nano")
+    llm = LLM(model="gpt-4o-mini")
     
     def mock_tool_executor(function_name, arguments):
         """Mock tool executor that simulates tool execution"""
@@ -128,10 +128,10 @@ def test_llm_directly():
         response = llm.get_response(
             prompt="Analyze the importance of AI in modern business",
             tools=[mock_tool],
-            self_reflect=True,
+            reflection=True,
             max_reflect=2,
             min_reflect=1,
-            verbose=True,
+            output="verbose",
             execute_tool_fn=mock_tool_executor
         )
         

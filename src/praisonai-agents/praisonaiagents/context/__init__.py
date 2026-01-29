@@ -99,6 +99,7 @@ __all__ = [
     "PruneToolsOptimizer",
     "NonDestructiveOptimizer",
     "SummarizeOptimizer",
+    "LLMSummarizeOptimizer",
     "SmartOptimizer",
     "get_optimizer",
     "get_effective_history",
@@ -125,6 +126,7 @@ __all__ = [
     "EstimationMetrics",
     "PerToolBudget",
     "SnapshotHookData",
+    "SessionDeduplicationCache",
     # Protocols (NEW)
     "ContextView",
     "ContextMutator",
@@ -157,6 +159,16 @@ __all__ = [
     "FastContextResult",
     "FileMatch",
     "LineRange",
+    # Artifacts (Dynamic Context Discovery)
+    "ArtifactRef",
+    "ArtifactMetadata",
+    "GrepMatch",
+    "QueueConfig",
+    "ArtifactStoreProtocol",
+    "HistoryStoreProtocol",
+    "TerminalLoggerProtocol",
+    "compute_checksum",
+    "generate_summary",
 ]
 
 
@@ -193,7 +205,7 @@ def __getattr__(name: str):
     # Optimization
     if name in ("BaseOptimizer", "TruncateOptimizer", "SlidingWindowOptimizer",
                 "PruneToolsOptimizer", "NonDestructiveOptimizer", "SummarizeOptimizer",
-                "SmartOptimizer", "get_optimizer"):
+                "LLMSummarizeOptimizer", "SmartOptimizer", "get_optimizer"):
         from . import optimizer
         return getattr(optimizer, name)
     
@@ -208,7 +220,8 @@ def __getattr__(name: str):
     if name in ("ContextManager", "MultiAgentContextManager", "create_context_manager",
                 "ManagerConfig", "ContextPolicy", "EstimationMode", "ContextShareMode",
                 "ToolShareMode", "OptimizationEvent", "OptimizationEventType",
-                "EstimationMetrics", "PerToolBudget", "SnapshotHookData"):
+                "EstimationMetrics", "PerToolBudget", "SnapshotHookData",
+                "SessionDeduplicationCache"):
         from . import manager
         return getattr(manager, name)
     
@@ -251,5 +264,22 @@ def __getattr__(name: str):
     if name == "LineRange":
         from praisonaiagents.context.fast.result import LineRange
         return LineRange
+    
+    # Artifacts (Dynamic Context Discovery)
+    if name in ("ArtifactRef", "ArtifactMetadata", "GrepMatch", "QueueConfig",
+                "ArtifactStoreProtocol", "HistoryStoreProtocol", "TerminalLoggerProtocol",
+                "compute_checksum", "generate_summary"):
+        from . import artifacts
+        return getattr(artifacts, name)
+    
+    # Session Context Tracking (Agno pattern)
+    if name in ("SessionContextTracker", "SessionState"):
+        from . import session_tracker
+        return getattr(session_tracker, name)
+    
+    # Context Aggregation (CrewAI pattern)
+    if name in ("ContextAggregator", "AggregatedContext", "create_aggregator_from_config"):
+        from . import aggregator
+        return getattr(aggregator, name)
     
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

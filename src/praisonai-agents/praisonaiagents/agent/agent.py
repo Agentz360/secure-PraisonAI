@@ -1,38 +1,143 @@
 import os
 import time
 import json
-import copy
 import logging
 import asyncio
-import threading
-from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Tuple, Generator
-from rich.console import Console
-from rich.live import Live
-from ..llm import (
-    get_openai_client,
-    ChatCompletionMessage,
-    Choice,
-    CompletionTokensDetails,
-    PromptTokensDetails,
-    CompletionUsage,
-    ChatCompletion,
-    ToolCall,
-    process_stream_chunks
-)
-from ..main import (
-    display_error,
-    display_tool_call,
-    display_instruction,
-    display_interaction,
-    display_generating,
-    display_self_reflection,
-    ReflectionOutput,
-    adisplay_instruction,
-    approval_callback,
-    execute_sync_callback
-)
+import contextlib
+from typing import List, Optional, Any, Dict, Union, Literal, TYPE_CHECKING, Callable, Generator
 import inspect
-import uuid
+
+# ============================================================================
+# Performance: Lazy imports for heavy dependencies
+# Rich, LLM, and display utilities are only imported when needed (output=verbose)
+# This reduces import time from ~420ms to ~20ms for silent mode
+# ============================================================================
+
+# Lazy-loaded modules (populated on first use)
+_rich_console = None
+_rich_live = None
+_llm_module = None
+_main_module = None
+_hooks_module = None
+_stream_emitter_class = None
+
+def _get_console():
+    """Lazy load rich.console.Console."""
+    global _rich_console
+    if _rich_console is None:
+        from rich.console import Console
+        _rich_console = Console
+    return _rich_console
+
+def _get_live():
+    """Lazy load rich.live.Live."""
+    global _rich_live
+    if _rich_live is None:
+        from rich.live import Live
+        _rich_live = Live
+    return _rich_live
+
+def _get_llm_functions():
+    """Lazy load LLM functions."""
+    global _llm_module
+    if _llm_module is None:
+        from ..llm import get_openai_client, process_stream_chunks
+        _llm_module = {
+            'get_openai_client': get_openai_client,
+            'process_stream_chunks': process_stream_chunks,
+        }
+    return _llm_module
+
+def _get_display_functions():
+    """Lazy load display functions from main module."""
+    global _main_module
+    if _main_module is None:
+        from ..main import (
+            display_error,
+            display_instruction,
+            display_interaction,
+            display_generating,
+            display_self_reflection,
+            ReflectionOutput,
+            adisplay_instruction,
+            execute_sync_callback
+        )
+        _main_module = {
+            'display_error': display_error,
+            'display_instruction': display_instruction,
+            'display_interaction': display_interaction,
+            'display_generating': display_generating,
+            'display_self_reflection': display_self_reflection,
+            'ReflectionOutput': ReflectionOutput,
+            'adisplay_instruction': adisplay_instruction,
+            'execute_sync_callback': execute_sync_callback,
+        }
+    return _main_module
+
+def _get_hooks_module():
+    """Lazy load hooks module for HookRunner and HookRegistry."""
+    global _hooks_module
+    if _hooks_module is None:
+        from ..hooks import HookRunner, HookRegistry
+        _hooks_module = {
+            'HookRunner': HookRunner,
+            'HookRegistry': HookRegistry,
+        }
+    return _hooks_module
+
+def _get_stream_emitter():
+    """Lazy load StreamEventEmitter class."""
+    global _stream_emitter_class
+    if _stream_emitter_class is None:
+        from ..streaming.events import StreamEventEmitter
+        _stream_emitter_class = StreamEventEmitter
+    return _stream_emitter_class
+
+# File extensions that indicate a file path (for output parameter detection)
+_FILE_EXTENSIONS = frozenset({'.txt', '.md', '.json', '.yaml', '.yml', '.html', '.csv', '.log', '.xml', '.rst'})
+
+def _is_file_path(value: str) -> bool:
+    """Check if a string looks like a file path (not a preset name).
+    
+    Used to detect when output="path/to/file.txt" should be treated as
+    output_file instead of a preset name.
+    
+    Args:
+        value: String to check
+        
+    Returns:
+        True if the string looks like a file path
+    """
+    # Contains path separator
+    if '/' in value or '\\' in value:
+        return True
+    # Ends with common file extension
+    lower = value.lower()
+    for ext in _FILE_EXTENSIONS:
+        if lower.endswith(ext):
+            return True
+    return False
+
+# ============================================================================
+# Performance: Module-level imports for param resolution (moved from __init__)
+# These imports are lightweight and avoid per-Agent import overhead
+# ============================================================================
+from ..config.param_resolver import resolve, ArrayMode
+from ..config.presets import (
+    OUTPUT_PRESETS, EXECUTION_PRESETS, MEMORY_PRESETS, MEMORY_URL_SCHEMES,
+    WEB_PRESETS, PLANNING_PRESETS, REFLECTION_PRESETS, CACHING_PRESETS,
+    DEFAULT_OUTPUT_MODE,
+)
+from ..config.feature_configs import (
+    OutputConfig, ExecutionConfig, MemoryConfig, KnowledgeConfig,
+    PlanningConfig, ReflectionConfig, GuardrailConfig, WebConfig,
+    TemplateConfig, CachingConfig, HooksConfig, SkillsConfig,
+)
+
+# Default tool output limit (16000 chars ≈ 4000 tokens)
+# Increased to allow full page content from search tools while still preventing overflow
+# Applied even when context management is disabled to prevent runaway tool outputs
+DEFAULT_TOOL_OUTPUT_LIMIT = 16000
 
 # Global variables for API server
 _server_started = {}  # Dict of port -> started boolean
@@ -43,11 +148,57 @@ _shared_apps = {}  # Dict of port -> FastAPI app
 
 if TYPE_CHECKING:
     from ..task.task import Task
-    from ..main import TaskOutput
-    from ..handoff import Handoff
+    from .handoff import Handoff, HandoffConfig, HandoffResult
     from ..rag.models import RAGResult, ContextPack
 
 class Agent:
+    # Class-level counter for generating unique display names for nameless agents
+    _agent_counter = 0
+    # Class-level cache for environment variables (avoid repeated os.environ.get)
+    _env_output_mode = None
+    _env_output_checked = False
+    _default_model = None
+    _default_model_checked = False
+    
+    @property
+    def _hook_runner(self):
+        """Lazy-loaded HookRunner for event-based hooks (zero overhead when not used)."""
+        if self.__hook_runner is None:
+            hooks_mod = _get_hooks_module()
+            self.__hook_runner = hooks_mod['HookRunner'](
+                registry=self._hooks_registry_param if isinstance(self._hooks_registry_param, hooks_mod['HookRegistry']) else None,
+                cwd=os.getcwd()
+            )
+        return self.__hook_runner
+    
+    @property
+    def stream_emitter(self):
+        """Lazy-loaded StreamEventEmitter for real-time events (zero overhead when not used)."""
+        if self.__stream_emitter is None:
+            self.__stream_emitter = _get_stream_emitter()()
+        return self.__stream_emitter
+    
+    @stream_emitter.setter
+    def stream_emitter(self, value):
+        """Allow setting stream_emitter directly."""
+        self.__stream_emitter = value
+    
+    @classmethod
+    def _get_env_output_mode(cls):
+        """Get cached PRAISONAI_OUTPUT env var value."""
+        if not cls._env_output_checked:
+            cls._env_output_mode = os.environ.get('PRAISONAI_OUTPUT', '').lower()
+            cls._env_output_checked = True
+        return cls._env_output_mode
+    
+    @classmethod
+    def _get_default_model(cls):
+        """Get cached default model name from OPENAI_MODEL_NAME env var."""
+        if not cls._default_model_checked:
+            cls._default_model = os.getenv('OPENAI_MODEL_NAME', 'gpt-4o-mini')
+            cls._default_model_checked = True
+        return cls._default_model
+    
     @classmethod
     def _configure_logging(cls):
         """Configure logging settings once for all agent instances."""
@@ -278,7 +429,7 @@ class Agent:
         reflection: Optional[Union[bool, Any]] = None,  # Union[bool, ReflectionConfig]
         guardrails: Optional[Union[bool, Callable, Any]] = None,  # Union[bool, Callable, GuardrailConfig]
         web: Optional[Union[bool, Any]] = None,  # Union[bool, WebConfig]
-        context: Optional[Union[bool, Any]] = False,  # Union[bool, ManagerConfig, ContextManager]
+        context: Optional[Union[bool, Any]] = None,  # Union[bool, ManagerConfig, ContextManager] - None=smart default
         autonomy: Optional[Union[bool, Dict[str, Any], Any]] = None,  # Union[bool, dict, AutonomyConfig]
         verification_hooks: Optional[List[Any]] = None,  # List of VerificationHook instances
         output: Optional[Union[str, Any]] = None,  # Union[str preset, OutputConfig]
@@ -291,102 +442,93 @@ class Agent:
         """Initialize an Agent instance.
 
         Args:
-            name (Optional[str], optional): Name of the agent used for identification and logging.
-                If None, defaults to "Agent". Defaults to None.
-            role (Optional[str], optional): Role or job title that defines the agent's expertise
-                and behavior patterns. Examples: "Data Analyst", "Content Writer". Defaults to None.
-            goal (Optional[str], optional): Primary objective or goal the agent aims to achieve.
-                Defines the agent's purpose and success criteria. Defaults to None.
-            backstory (Optional[str], optional): Background story or context that shapes the agent's
-                personality and decision-making approach. Defaults to None.
-            instructions (Optional[str], optional): Direct instructions that override role, goal,
-                and backstory when provided. Used for simple, task-specific agents. Defaults to None.
-            llm (Optional[Union[str, Any]], optional): Language model configuration. Can be a model
-                name string (e.g., "gpt-5-nano", "anthropic/claude-3-sonnet") or a configured LLM object.
-                Defaults to environment variable OPENAI_MODEL_NAME or "gpt-5-nano".
-            tools (Optional[List[Any]], optional): List of tools, functions, or capabilities
-                available to the agent for task execution. Can include callables, tool objects,
-                or MCP instances. Defaults to None.
-            function_calling_llm (Optional[Any], optional): Dedicated language model for function
-                calling operations. If None, uses the main llm parameter. Defaults to None.
-            max_iter (int, optional): Maximum number of iterations the agent can perform during
-                task execution to prevent infinite loops. Defaults to 20.
-            max_rpm (Optional[int], optional): Maximum requests per minute to rate limit API calls
-                and prevent quota exhaustion. If None, no rate limiting is applied. Defaults to None.
-            max_execution_time (Optional[int], optional): Maximum execution time in seconds for
-                agent operations before timeout. If None, no time limit is enforced. Defaults to None.
-            memory (Optional[Any], optional): Memory system for storing and retrieving information
-                across conversations. Requires memory dependencies to be installed. Defaults to None.
-            verbose (bool, optional): Enable detailed logging and status updates during agent
-                execution for debugging and monitoring. Defaults to True.
-            allow_delegation (bool, optional): Allow the agent to delegate tasks to other agents
-                or sub-processes when appropriate. Defaults to False.
-            step_callback (Optional[Any], optional): Callback function called after each step
-                of agent execution for custom monitoring or intervention. Defaults to None.
-            cache (bool, optional): Enable caching of responses and computations to improve
-                performance and reduce API costs. Defaults to True.
-            system_template (Optional[str], optional): Custom template for system prompts that
-                overrides the default system prompt generation. Defaults to None.
-            prompt_template (Optional[str], optional): Template for formatting user prompts
-                before sending to the language model. Defaults to None.
-            response_template (Optional[str], optional): Template for formatting agent responses
-                before returning to the user. Defaults to None.
-            allow_code_execution (Optional[bool], optional): Enable the agent to execute code
-                snippets during task completion. Use with caution for security. Defaults to False.
-            max_retry_limit (int, optional): Maximum number of retry attempts for failed operations
-                before giving up. Helps handle transient errors. Defaults to 2.
-            code_execution_mode (Literal["safe", "unsafe"], optional): Safety mode for code execution.
-                "safe" restricts dangerous operations, "unsafe" allows full code execution. Defaults to "safe".
-            embedder_config (Optional[Dict[str, Any]], optional): Configuration dictionary for
-                text embedding models used in knowledge retrieval and similarity search. Defaults to None.
-            knowledge (Optional[List[str]], optional): List of knowledge sources (file paths, URLs,
-                or text content) to be processed and made available to the agent. Defaults to None.
-            knowledge_config (Optional[Dict[str, Any]], optional): Configuration for knowledge
-                processing and retrieval system including chunking and indexing parameters. Defaults to None.
-            use_system_prompt (Optional[bool], optional): Whether to include system prompts in
-                conversations to establish agent behavior and context. Defaults to True.
-            markdown (bool, optional): Enable markdown formatting in agent responses for better
-                readability and structure. Defaults to True.
-            stream (bool, optional): Enable streaming responses from the language model for real-time
-                output when using Agent.start() method. Defaults to False for backward compatibility.
-            metrics (bool, optional): Enable automatic token usage tracking and display summary
-                when tasks complete. Simplifies token monitoring for cost optimization. Defaults to False.
-            self_reflect (bool, optional): Enable self-reflection capabilities where the agent
-                evaluates and improves its own responses. Defaults to False.
-            max_reflect (int, optional): Maximum number of self-reflection iterations to prevent
-                excessive reflection loops. Defaults to 3.
-            min_reflect (int, optional): Minimum number of self-reflection iterations required
-                before accepting a response as satisfactory. Defaults to 1.
-            reflect_llm (Optional[str], optional): Dedicated language model for self-reflection
-                operations. If None, uses the main llm parameter. Defaults to None.
-            reflect_prompt (Optional[str], optional): Custom prompt template for self-reflection
-                that guides the agent's self-evaluation process. Defaults to None.
-            user_id (Optional[str], optional): Unique identifier for the user or session to
-                enable personalized responses and memory isolation. Defaults to "praison".
-            reasoning_steps (bool, optional): Enable step-by-step reasoning output to show the
-                agent's thought process during problem solving. Defaults to False.
-            guardrail (Optional[Union[Callable[['TaskOutput'], Tuple[bool, Any]], str]], optional):
-                Safety mechanism to validate agent outputs. Can be a validation function or
-                description string for LLM-based validation. Defaults to None.
-            max_guardrail_retries (int, optional): Maximum number of retry attempts when guardrail
-                validation fails before giving up. Defaults to 3.
-            handoffs (Optional[List[Union['Agent', 'Handoff']]], optional): List of agents or
-                handoff configurations that this agent can delegate tasks to. Enables agent-to-agent
-                collaboration and task specialization. Defaults to None.
-            base_url (Optional[str], optional): Base URL for custom LLM endpoints (e.g., Ollama).
-                If provided, automatically creates a custom LLM instance. Defaults to None.
-            api_key (Optional[str], optional): API key for LLM provider. If not provided,
-                falls back to environment variables. Defaults to None.
+            name: Agent name for identification and logging. Defaults to "Agent".
+            role: Role/job title defining expertise (e.g., "Data Analyst").
+            goal: Primary objective the agent aims to achieve.
+            backstory: Background context shaping personality and decisions.
+            instructions: Direct instructions (overrides role/goal/backstory). Recommended for simple agents.
+            llm: Model name string ("gpt-4o", "anthropic/claude-3-sonnet") or LLM object.
+                Defaults to OPENAI_MODEL_NAME env var or "gpt-4o-mini".
+            model: Alias for llm parameter.
+            function_calling_llm: Dedicated LLM for function calling. Deprecated: use llm=.
+            llm_config: LLM configuration dict. Deprecated: use llm=.
+            base_url: Custom LLM endpoint URL (e.g., for Ollama). Kept separate for auth.
+            api_key: API key for LLM provider. Kept separate for auth.
+            tools: List of tools, functions, callables, or MCP instances.
+            allow_delegation: Allow task delegation to other agents. Defaults to False.
+            allow_code_execution: Enable code execution during tasks. Defaults to False.
+            code_execution_mode: "safe" (restricted) or "unsafe" (full access). Defaults to "safe".
+            handoffs: List of Agent or Handoff objects for agent-to-agent collaboration.
+            auto_save: Session name for automatic session saving.
+            rate_limiter: Rate limiter instance for API call throttling.
+            memory: Memory system configuration. Accepts:
+                - bool: True enables defaults, False disables
+                - MemoryConfig: Custom configuration
+                - MemoryManager: Pre-configured instance
+            knowledge: Knowledge sources. Accepts:
+                - bool: True enables defaults
+                - List[str]: File paths, URLs, or text content
+                - KnowledgeConfig: Custom configuration
+            planning: Planning mode. Accepts:
+                - bool: True enables with defaults
+                - PlanningConfig: Custom configuration
+            reflection: Self-reflection. Accepts:
+                - bool: True enables with defaults
+                - ReflectionConfig: Custom configuration
+            guardrails: Output validation. Accepts:
+                - bool: True enables with defaults
+                - Callable: Validation function
+                - GuardrailConfig: Custom configuration
+            web: Web search/fetch. Accepts:
+                - bool: True enables with defaults
+                - WebConfig: Custom configuration
+            context: Context management. Accepts:
+                - bool: True enables with defaults
+                - ManagerConfig: Custom configuration
+            autonomy: Autonomy settings. Accepts:
+                - bool: True enables with defaults
+                - Dict: Configuration dict
+                - AutonomyConfig: Custom configuration
+            verification_hooks: List of VerificationHook instances for output verification.
+            output: Output configuration. Accepts:
+                - str: Preset name ("silent", "actions", "verbose", "json", "stream")
+                - OutputConfig: Custom configuration
+                Controls: verbose, markdown, stream, metrics, reasoning_steps
+            execution: Execution configuration. Accepts:
+                - str: Preset name ("fast", "balanced", "thorough")
+                - ExecutionConfig: Custom configuration
+                Controls: max_iter, max_rpm, max_execution_time, max_retry_limit
+            templates: Template configuration (TemplateConfig).
+                Controls: system_template, prompt_template, response_template
+            caching: Caching configuration. Accepts:
+                - bool: True enables with defaults
+                - CachingConfig: Custom configuration
+            hooks: Event hooks. Accepts:
+                - List: List of hook callables
+                - HooksConfig: Custom configuration
+            skills: Agent skills. Accepts:
+                - List[str]: Skill directory paths
+                - SkillsConfig: Custom configuration
 
         Raises:
             ValueError: If all of name, role, goal, backstory, and instructions are None.
             ImportError: If memory or LLM features are requested but dependencies are not installed.
+
+        Note:
+            Many legacy parameters have been consolidated into config objects:
+            - verbose, markdown, stream, metrics, reasoning_steps → output=
+            - max_iter, max_rpm, max_execution_time, max_retry_limit → execution=
+            - self_reflect, max_reflect, min_reflect, reflect_llm → reflection=
+            - guardrail, max_guardrail_retries → guardrails=
+            - system_template, prompt_template, response_template → templates=
+            - cache, prompt_caching → caching=
+            - web_search, web_fetch → web=
         """
         # Add check at start if memory is requested
         if memory is not None:
             try:
-                from ..memory.memory import Memory
-                MEMORY_AVAILABLE = True
+                from ..memory.memory import Memory  # noqa: F401
+                _ = Memory  # Silence unused import warning - we just check availability
             except ImportError:
                 raise ImportError(
                     "Memory features requested in Agent but memory dependencies not installed. "
@@ -405,19 +547,8 @@ class Agent:
         # ============================================================
         # CONSOLIDATED PARAMS EXTRACTION (agent-centric API)
         # Uses unified resolver: Instance > Config > Array > String > Bool > Default
+        # Note: Imports moved to module level for performance
         # ============================================================
-        
-        # Import resolver and config classes
-        from ..config.param_resolver import resolve, ArrayMode
-        from ..config.presets import (
-            OUTPUT_PRESETS, EXECUTION_PRESETS, MEMORY_PRESETS, MEMORY_URL_SCHEMES,
-            WEB_PRESETS, PLANNING_PRESETS, REFLECTION_PRESETS, CACHING_PRESETS,
-        )
-        from ..config.feature_configs import (
-            OutputConfig, ExecutionConfig, MemoryConfig, KnowledgeConfig,
-            PlanningConfig, ReflectionConfig, GuardrailConfig, WebConfig,
-            TemplateConfig, CachingConfig, HooksConfig, SkillsConfig,
-        )
         
         # Initialize extracted values with defaults
         user_id = None
@@ -445,30 +576,43 @@ class Agent:
         skills_dirs = None
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve OUTPUT param using unified resolver
-        # Supports: None, str preset, list [preset, overrides], OutputConfig
+        # Resolve OUTPUT param - FAST PATH for common cases
         # DEFAULT: "silent" mode (zero overhead, fastest performance)
-        # Can be overridden by PRAISONAI_OUTPUT env var
         # ─────────────────────────────────────────────────────────────────────
-        from ..config.presets import DEFAULT_OUTPUT_MODE
-        
-        # Check for env var override
-        env_output = os.environ.get('PRAISONAI_OUTPUT', '').lower()
-        if env_output and env_output in OUTPUT_PRESETS and output is None:
-            output = env_output
-        
-        # Use default output mode if not specified
+        # Fast path: None -> silent defaults (use cached env var)
         if output is None:
-            output = DEFAULT_OUTPUT_MODE
+            env_output = Agent._get_env_output_mode()
+            if env_output and env_output in OUTPUT_PRESETS:
+                output = env_output
+            else:
+                output = DEFAULT_OUTPUT_MODE
+            _has_explicit_output = False
+        else:
+            _has_explicit_output = True
         
-        _output_config = resolve(
-            value=output,
-            param_name="output",
-            config_class=OutputConfig,
-            presets=OUTPUT_PRESETS,
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=OutputConfig(),  # OutputConfig defaults to silent mode (zero overhead)
-        )
+        # Fast path: string preset lookup (most common case)
+        if isinstance(output, str):
+            output_lower = output.lower()
+            preset_value = OUTPUT_PRESETS.get(output_lower)
+            if preset_value is not None:
+                _output_config = OutputConfig(**preset_value) if isinstance(preset_value, dict) else preset_value
+            elif _is_file_path(output):
+                # String looks like a file path - use as output_file
+                _output_config = OutputConfig(output_file=output)
+            else:
+                _output_config = OutputConfig()  # Default silent
+        elif isinstance(output, OutputConfig):
+            _output_config = output
+        else:
+            # Complex case: use full resolver
+            _output_config = resolve(
+                value=output,
+                param_name="output",
+                config_class=OutputConfig,
+                presets=OUTPUT_PRESETS,
+                array_mode=ArrayMode.PRESET_OVERRIDE,
+                default=OutputConfig(),
+            )
         if _output_config:
             verbose = _output_config.verbose
             markdown = _output_config.markdown
@@ -478,35 +622,69 @@ class Agent:
             output_style = getattr(_output_config, 'style', None)
             actions_trace = getattr(_output_config, 'actions_trace', False)  # Default False (silent)
             json_output = getattr(_output_config, 'json_output', False)
+            status_trace = getattr(_output_config, 'status_trace', False)  # New: clean inline status
+            simple_output = getattr(_output_config, 'simple_output', False)  # status preset: no timestamps
+            output_file = getattr(_output_config, 'output_file', None)  # Auto-save to file
+            output_template = getattr(_output_config, 'template', None)  # Response template
         else:
             # Fallback defaults match silent mode (zero overhead)
             verbose, markdown, stream, metrics, reasoning_steps = False, False, False, False, False
             actions_trace = False  # No callbacks by default
             json_output = False
+            status_trace = False
+            simple_output = False
         
-        # Enable actions output mode if configured
-        # This registers callbacks to capture tool calls and final output
-        if actions_trace:
+        # Enable trace output mode if configured (takes priority)
+        # This provides timestamped inline status with duration
+        if status_trace:
             try:
-                from ..output.actions import enable_actions_mode, is_actions_mode_enabled
-                if not is_actions_mode_enabled():
-                    output_format = "jsonl" if json_output else "text"
-                    enable_actions_mode(redact=True, use_color=True, format=output_format)
+                from ..output.trace import enable_trace_output, is_trace_output_enabled
+                if not is_trace_output_enabled():
+                    enable_trace_output(use_color=True, show_timestamps=True)
             except ImportError:
-                pass  # Actions module not available
+                pass  # Trace module not available
+        # Enable status output mode if configured (simple progress, no timestamps)
+        # This registers callbacks to capture tool calls and final output
+        elif actions_trace:
+            try:
+                from ..output.status import enable_status_output, is_status_output_enabled
+                if not is_status_output_enabled():
+                    output_format = "jsonl" if json_output else "text"
+                    # simple_output=True means status preset (no timestamps)
+                    # metrics=True means debug preset (show token/cost info)
+                    enable_status_output(
+                        redact=True,
+                        use_color=True,
+                        format=output_format,
+                        show_timestamps=not simple_output,
+                        show_metrics=metrics
+                    )
+            except ImportError:
+                pass  # Status module not available
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve EXECUTION param using unified resolver
-        # Supports: None, str preset, list [preset, overrides], ExecutionConfig
+        # Resolve EXECUTION param - FAST PATH for common cases
         # ─────────────────────────────────────────────────────────────────────
-        _exec_config = resolve(
-            value=execution,
-            param_name="execution",
-            config_class=ExecutionConfig,
-            presets=EXECUTION_PRESETS,
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=ExecutionConfig(),
-        )
+        # Fast path: None -> default config (skip resolve() call)
+        if execution is None:
+            _exec_config = ExecutionConfig()
+        elif isinstance(execution, ExecutionConfig):
+            _exec_config = execution
+        elif isinstance(execution, str):
+            preset_value = EXECUTION_PRESETS.get(execution.lower())
+            if preset_value is not None:
+                _exec_config = ExecutionConfig(**preset_value) if isinstance(preset_value, dict) else preset_value
+            else:
+                _exec_config = ExecutionConfig()
+        else:
+            _exec_config = resolve(
+                value=execution,
+                param_name="execution",
+                config_class=ExecutionConfig,
+                presets=EXECUTION_PRESETS,
+                array_mode=ArrayMode.PRESET_OVERRIDE,
+                default=ExecutionConfig(),
+            )
         if _exec_config:
             max_iter = _exec_config.max_iter
             max_rpm = _exec_config.max_rpm
@@ -516,14 +694,22 @@ class Agent:
             max_iter, max_rpm, max_execution_time, max_retry_limit = 20, None, None, 2
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve TEMPLATES param
+        # Resolve TEMPLATES param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
-        _template_config = resolve(
-            value=templates,
-            param_name="templates",
-            config_class=TemplateConfig,
-            default=None,
-        )
+        # Fast path: None -> no templates (skip resolve() call)
+        if templates is None:
+            _template_config = None
+        elif isinstance(templates, TemplateConfig):
+            _template_config = templates
+        elif isinstance(templates, dict):
+            _template_config = TemplateConfig(**templates)
+        else:
+            _template_config = resolve(
+                value=templates,
+                param_name="templates",
+                config_class=TemplateConfig,
+                default=None,
+            )
         if _template_config:
             system_template = _template_config.system
             prompt_template = _template_config.prompt
@@ -533,16 +719,25 @@ class Agent:
             system_template, prompt_template, response_template, use_system_prompt = None, None, None, True
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve CACHING param
-        # Supports: None, bool, str preset, CachingConfig
+        # Resolve CACHING param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
-        _caching_config = resolve(
-            value=caching,
-            param_name="caching",
-            config_class=CachingConfig,
-            presets=CACHING_PRESETS,
-            default=CachingConfig() if caching is None else None,
-        )
+        # Fast path: None -> default caching, False -> disabled
+        if caching is None:
+            _caching_config = CachingConfig()
+        elif caching is False:
+            _caching_config = None
+        elif caching is True:
+            _caching_config = CachingConfig()
+        elif isinstance(caching, CachingConfig):
+            _caching_config = caching
+        else:
+            _caching_config = resolve(
+                value=caching,
+                param_name="caching",
+                config_class=CachingConfig,
+                presets=CACHING_PRESETS,
+                default=CachingConfig(),
+            )
         if _caching_config:
             cache = _caching_config.enabled
             prompt_caching = _caching_config.prompt_caching
@@ -552,18 +747,25 @@ class Agent:
             cache, prompt_caching = True, None
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve HOOKS param using unified resolver
-        # Supports: None, list of callables, HooksConfig, dict
+        # Resolve HOOKS param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
         _hooks_list = []
         step_callback = None
-        _hooks_config = resolve(
-            value=hooks,
-            param_name="hooks",
-            config_class=HooksConfig,
-            array_mode=ArrayMode.PASSTHROUGH,
-            default=None,
-        )
+        # Fast path: None -> no hooks (skip resolve() call)
+        if hooks is None:
+            _hooks_config = None
+        elif isinstance(hooks, list):
+            _hooks_config = hooks  # Passthrough list directly
+        elif isinstance(hooks, HooksConfig):
+            _hooks_config = hooks
+        else:
+            _hooks_config = resolve(
+                value=hooks,
+                param_name="hooks",
+                config_class=HooksConfig,
+                array_mode=ArrayMode.PASSTHROUGH,
+                default=None,
+            )
         if _hooks_config is not None:
             if isinstance(_hooks_config, list):
                 _hooks_list = _hooks_config
@@ -572,19 +774,26 @@ class Agent:
                 _hooks_list = _hooks_config.middleware or []
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve SKILLS param using unified resolver
-        # Supports: None, list of paths, SkillsConfig, str
+        # Resolve SKILLS param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
         _skills = None
         skills_dirs = None
-        _skills_config = resolve(
-            value=skills,
-            param_name="skills",
-            config_class=SkillsConfig,
-            array_mode=ArrayMode.SOURCES,
-            string_mode="path_as_source",
-            default=None,
-        )
+        # Fast path: None -> no skills (skip resolve() call)
+        if skills is None:
+            _skills_config = None
+        elif isinstance(skills, list):
+            _skills_config = SkillsConfig(sources=skills)
+        elif isinstance(skills, SkillsConfig):
+            _skills_config = skills
+        else:
+            _skills_config = resolve(
+                value=skills,
+                param_name="skills",
+                config_class=SkillsConfig,
+                array_mode=ArrayMode.SOURCES,
+                string_mode="path_as_source",
+                default=None,
+            )
         if _skills_config is not None:
             if isinstance(_skills_config, SkillsConfig):
                 _skills = _skills_config.paths
@@ -593,19 +802,30 @@ class Agent:
                 _skills = _skills_config
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve MEMORY param using unified resolver
-        # Supports: None, bool, str preset, str URL, list, MemoryConfig, Instance
+        # Resolve MEMORY param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
-        _memory_config = resolve(
-            value=memory,
-            param_name="memory",
-            config_class=MemoryConfig,
-            presets=MEMORY_PRESETS,
-            url_schemes=MEMORY_URL_SCHEMES,
-            instance_check=lambda v: (hasattr(v, 'search') and hasattr(v, 'add')) or hasattr(v, 'database_url'),
-            array_mode=ArrayMode.SINGLE_OR_LIST,
-            default=None,
-        )
+        # Fast path: None/False -> no memory (skip resolve() call)
+        if memory is None or memory is False:
+            _memory_config = None
+        elif memory is True:
+            _memory_config = MemoryConfig()
+        elif isinstance(memory, MemoryConfig):
+            _memory_config = memory
+        elif hasattr(memory, 'search') and hasattr(memory, 'add'):
+            _memory_config = memory  # Memory instance passthrough
+        elif hasattr(memory, 'database_url'):
+            _memory_config = memory  # db() instance passthrough
+        else:
+            _memory_config = resolve(
+                value=memory,
+                param_name="memory",
+                config_class=MemoryConfig,
+                presets=MEMORY_PRESETS,
+                url_schemes=MEMORY_URL_SCHEMES,
+                instance_check=lambda v: (hasattr(v, 'search') and hasattr(v, 'add')) or hasattr(v, 'database_url'),
+                array_mode=ArrayMode.SINGLE_OR_LIST,
+                default=None,
+            )
         
         # Extract values from resolved memory config
         if _memory_config is not None:
@@ -636,21 +856,32 @@ class Agent:
             memory = None
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve KNOWLEDGE param using unified resolver
-        # Supports: None, bool, str path, list of sources, KnowledgeConfig, Instance
+        # Resolve KNOWLEDGE param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
         retrieval_config = None
         embedder_config = None
         
-        _knowledge_config = resolve(
-            value=knowledge,
-            param_name="knowledge",
-            config_class=KnowledgeConfig,
-            instance_check=lambda v: hasattr(v, 'search') and hasattr(v, 'add'),
-            array_mode=ArrayMode.SOURCES_WITH_CONFIG,
-            string_mode="path_as_source",
-            default=None,
-        )
+        # Fast path: None/False -> no knowledge (skip resolve() call)
+        if knowledge is None or knowledge is False:
+            _knowledge_config = None
+        elif knowledge is True:
+            _knowledge_config = KnowledgeConfig()
+        elif isinstance(knowledge, KnowledgeConfig):
+            _knowledge_config = knowledge
+        elif isinstance(knowledge, list):
+            _knowledge_config = KnowledgeConfig(sources=knowledge)
+        elif hasattr(knowledge, 'search') and hasattr(knowledge, 'add'):
+            _knowledge_config = knowledge  # Knowledge instance passthrough
+        else:
+            _knowledge_config = resolve(
+                value=knowledge,
+                param_name="knowledge",
+                config_class=KnowledgeConfig,
+                instance_check=lambda v: hasattr(v, 'search') and hasattr(v, 'add'),
+                array_mode=ArrayMode.SOURCES_WITH_CONFIG,
+                string_mode="path_as_source",
+                default=None,
+            )
         
         if _knowledge_config is not None:
             if hasattr(_knowledge_config, 'search') and hasattr(_knowledge_config, 'add'):
@@ -674,18 +905,25 @@ class Agent:
             knowledge = None
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve PLANNING param
-        # Supports: None, bool, str LLM/preset, list, PlanningConfig
+        # Resolve PLANNING param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
-        _planning_config = resolve(
-            value=planning,
-            param_name="planning",
-            config_class=PlanningConfig,
-            presets=PLANNING_PRESETS,
-            string_mode="llm_model",
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=None,
-        )
+        # Fast path: None/False -> no planning (skip resolve() call)
+        if planning is None or planning is False:
+            _planning_config = None
+        elif planning is True:
+            _planning_config = PlanningConfig()
+        elif isinstance(planning, PlanningConfig):
+            _planning_config = planning
+        else:
+            _planning_config = resolve(
+                value=planning,
+                param_name="planning",
+                config_class=PlanningConfig,
+                presets=PLANNING_PRESETS,
+                string_mode="llm_model",
+                array_mode=ArrayMode.PRESET_OVERRIDE,
+                default=None,
+            )
         
         if _planning_config is not None:
             if isinstance(_planning_config, PlanningConfig):
@@ -701,17 +939,24 @@ class Agent:
             planning = False
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve REFLECTION param
-        # Supports: None, bool, str preset, list, ReflectionConfig
+        # Resolve REFLECTION param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
-        _reflection_config = resolve(
-            value=reflection,
-            param_name="reflection",
-            config_class=ReflectionConfig,
-            presets=REFLECTION_PRESETS,
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=None,
-        )
+        # Fast path: None/False -> no reflection (skip resolve() call)
+        if reflection is None or reflection is False:
+            _reflection_config = None
+        elif reflection is True:
+            _reflection_config = ReflectionConfig()
+        elif isinstance(reflection, ReflectionConfig):
+            _reflection_config = reflection
+        else:
+            _reflection_config = resolve(
+                value=reflection,
+                param_name="reflection",
+                config_class=ReflectionConfig,
+                presets=REFLECTION_PRESETS,
+                array_mode=ArrayMode.PRESET_OVERRIDE,
+                default=None,
+            )
         
         if _reflection_config is not None:
             if isinstance(_reflection_config, ReflectionConfig):
@@ -728,14 +973,24 @@ class Agent:
             self_reflect = False
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve GUARDRAILS param using unified resolver
-        # Supports: None, bool, callable, str prompt, GuardrailConfig
+        # Resolve GUARDRAILS param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
-        from .._resolver_helpers import resolve_guardrails as _resolve_guardrails
-        _guardrails_config = _resolve_guardrails(
-            value=guardrails,
-            config_class=GuardrailConfig,
-        )
+        # Fast path: None/False -> no guardrails (skip resolve() call)
+        if guardrails is None or guardrails is False:
+            _guardrails_config = None
+        elif callable(guardrails) and not isinstance(guardrails, type):
+            _guardrails_config = guardrails  # Callable passthrough
+        elif isinstance(guardrails, GuardrailConfig):
+            _guardrails_config = guardrails
+        elif isinstance(guardrails, str):
+            # String could be LLM prompt - passthrough for later processing
+            _guardrails_config = guardrails
+        else:
+            from .._resolver_helpers import resolve_guardrails as _resolve_guardrails
+            _guardrails_config = _resolve_guardrails(
+                value=guardrails,
+                config_class=GuardrailConfig,
+            )
         
         if _guardrails_config is not None:
             if callable(_guardrails_config) and not isinstance(_guardrails_config, type):
@@ -749,17 +1004,24 @@ class Agent:
                 guardrail = _guardrails_config
         
         # ─────────────────────────────────────────────────────────────────────
-        # Resolve WEB param using unified resolver
-        # Supports: None, bool, str provider/mode, list, WebConfig
+        # Resolve WEB param - FAST PATH
         # ─────────────────────────────────────────────────────────────────────
-        _web_config = resolve(
-            value=web,
-            param_name="web",
-            config_class=WebConfig,
-            presets=WEB_PRESETS,
-            array_mode=ArrayMode.PRESET_OVERRIDE,
-            default=None,
-        )
+        # Fast path: None/False -> no web (skip resolve() call)
+        if web is None or web is False:
+            _web_config = None
+        elif web is True:
+            _web_config = WebConfig()
+        elif isinstance(web, WebConfig):
+            _web_config = web
+        else:
+            _web_config = resolve(
+                value=web,
+                param_name="web",
+                config_class=WebConfig,
+                presets=WEB_PRESETS,
+                array_mode=ArrayMode.PRESET_OVERRIDE,
+                default=None,
+            )
         
         if _web_config is not None:
             if isinstance(_web_config, WebConfig):
@@ -784,7 +1046,19 @@ class Agent:
 
         # If instructions are provided, use them to set role, goal, and backstory
         if instructions:
-            self.name = name or "Agent"
+            # Only use explicitly provided name, don't auto-generate from instructions
+            # Auto-generation was producing confusing names like "You Are Agent" from
+            # instructions like "You are a helpful assistant"
+            if name:
+                self.name = name
+                self._agent_index = None  # Named agents don't need an index
+            else:
+                # Don't auto-generate - None signals "no explicit name provided"
+                # Display logic will skip Agent Info panel when name is None
+                self.name = None
+                # Assign unique index for display_name
+                Agent._agent_counter += 1
+                self._agent_index = Agent._agent_counter
             self.role = role or "Assistant"
             self.goal = goal or instructions
             self.backstory = backstory or instructions
@@ -793,6 +1067,7 @@ class Agent:
         else:
             # Use provided values or defaults
             self.name = name or "Agent"
+            self._agent_index = None  # Named agents don't need an index
             self.role = role or "Assistant"
             self.goal = goal or "Help the user with their tasks"
             self.backstory = backstory or "I am an AI assistant"
@@ -809,6 +1084,11 @@ class Agent:
         self._hooks = _hooks_list if _hooks_list else []
         self._middleware_manager = None  # Lazy init
         
+        # Lazy init for HookRunner and StreamEventEmitter (zero overhead when not used)
+        self.__hook_runner = None  # Will be initialized on first access
+        self.__stream_emitter = None  # Will be initialized on first access
+        self._hooks_registry_param = hooks  # Store for lazy init
+        
         # Store llm_config for configurable model switching
         self._llm_config = llm_config or {}
         self._llm_configurable = self._llm_config.get('configurable', False)
@@ -817,7 +1097,6 @@ class Agent:
         # LLM CONSOLIDATION: Handle model= alias and deprecation warnings
         # Precedence: llm= > model= > default
         # ============================================================
-        import warnings
         
         # Handle model= alias for llm= (NO warnings - both are valid)
         if llm is None and model is not None:
@@ -852,8 +1131,8 @@ class Agent:
                     llm_config['metrics'] = metrics
                     self.llm_instance = LLM(**llm_config)
                 else:
-                    # Create LLM with model string and base_url
-                    model_name = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+                    # Create LLM with model string and base_url (cached for performance)
+                    model_name = llm or Agent._get_default_model()
                     self.llm_instance = LLM(
                         model=model_name,
                         base_url=base_url,
@@ -903,6 +1182,7 @@ class Agent:
                 llm_params['claude_memory'] = claude_memory
                 self.llm_instance = LLM(**llm_params)
                 self._using_custom_llm = True
+                self.llm = llm
                 
                 # Ensure tools are properly accessible when using custom LLM
                 if tools:
@@ -914,9 +1194,9 @@ class Agent:
                     "LLM features requested but dependencies not installed. "
                     "Please install with: pip install \"praisonaiagents[llm]\""
                 ) from e
-        # Otherwise, fall back to OpenAI environment/name
+        # Otherwise, fall back to OpenAI environment/name (cached for performance)
         else:
-            self.llm = llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+            self.llm = llm or Agent._get_default_model()
         # Handle tools parameter - ensure it's always a list
         if callable(tools):
             # If a single function/callable is passed, wrap it in a list
@@ -940,6 +1220,7 @@ class Agent:
         self._memory_instance = None
         self._init_memory(memory, user_id)
         self.verbose = verbose
+        self._has_explicit_output_config = _has_explicit_output  # Track if user set output mode
         self.allow_delegation = allow_delegation
         self.step_callback = step_callback
         self.cache = cache
@@ -952,17 +1233,17 @@ class Agent:
         self.embedder_config = embedder_config
         self.knowledge = knowledge
         self.use_system_prompt = use_system_prompt
-        # Thread-safe chat_history with lock for concurrent access
+        # Thread-safe chat_history with lazy lock for concurrent access
         self.chat_history = []
-        self._history_lock = threading.Lock()
+        self.__history_lock = None  # Lazy initialized
         self.markdown = markdown
         self.stream = stream
         self.metrics = metrics
         self.max_reflect = max_reflect
         self.min_reflect = min_reflect
         self.reflect_prompt = reflect_prompt
-        # Use the same model selection logic for reflect_llm
-        self.reflect_llm = reflect_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+        # Use the same model selection logic for reflect_llm (cached for performance)
+        self.reflect_llm = reflect_llm or Agent._get_default_model()
         self._console = None  # Lazy load console when needed
         
         # Initialize system prompt
@@ -1019,11 +1300,10 @@ Your Goal: {self.goal}
         self._guardrail_fn = None
         self._setup_guardrail()
         
-        # Cache for system prompts and formatted tools with thread-safe lock
-        # RLock allows re-entrant access from the same thread
+        # Cache for system prompts and formatted tools with lazy thread-safe lock
         self._system_prompt_cache = {}
         self._formatted_tools_cache = {}
-        self._cache_lock = threading.RLock()
+        self.__cache_lock = None  # Lazy initialized RLock
         # Limit cache size to prevent unbounded growth
         self._max_cache_size = 100
 
@@ -1091,12 +1371,54 @@ Your Goal: {self.goal}
         self._thinking_budget = thinking_budget
         
         # Context management (lazy loaded for zero overhead when disabled)
-        self._context_param = context  # Store raw param for lazy init
+        # Smart default: auto-enable context when tools are present
+        if context is None and self.tools:
+            # Tools present but no explicit context setting - auto-enable
+            self._context_param = True
+        else:
+            self._context_param = context  # Store raw param for lazy init
         self._context_manager = None  # Lazy initialized on first use
         self._context_manager_initialized = False
+        self._session_dedup_cache = None  # Shared session cache from workflow
         
         # Action trace mode - handled via display callbacks, not separate emitter
         self._actions_trace = actions_trace
+        
+        # Output file and template - for auto-saving response to file
+        self._output_file = output_file if _output_config else None
+        self._output_template = output_template if _output_config else None
+
+        # Telemetry - lazy initialized via property for performance
+        self.__telemetry = None
+        self.__telemetry_initialized = False
+
+    @property
+    def _telemetry(self):
+        """Lazy-loaded telemetry instance for performance."""
+        if not self.__telemetry_initialized:
+            try:
+                from ..telemetry import get_telemetry
+                self.__telemetry = get_telemetry()
+            except (ImportError, AttributeError):
+                self.__telemetry = None
+            self.__telemetry_initialized = True
+        return self.__telemetry
+
+    @property
+    def _history_lock(self):
+        """Lazy-loaded history lock for thread-safe chat history access."""
+        if self.__history_lock is None:
+            import threading
+            self.__history_lock = threading.Lock()
+        return self.__history_lock
+
+    @property
+    def _cache_lock(self):
+        """Lazy-loaded cache lock for thread-safe cache access."""
+        if self.__cache_lock is None:
+            import threading
+            self.__cache_lock = threading.RLock()
+        return self.__cache_lock
 
     @property
     def auto_memory(self):
@@ -1190,14 +1512,50 @@ Your Goal: {self.goal}
             self._context_manager = ContextManager(
                 model=self.llm if isinstance(self.llm, str) else "gpt-4o-mini",
                 agent_name=self.name or "Agent",
+                session_cache=self._session_dedup_cache,  # Share session cache from workflow
+                llm_summarize_fn=self._create_llm_summarize_fn(),  # Auto-wire LLM summarization
             )
         elif isinstance(self._context_param, ManagerConfig):
-            # Use provided config
+            # Use provided ManagerConfig
             self._context_manager = ContextManager(
                 model=self.llm if isinstance(self.llm, str) else "gpt-4o-mini",
                 config=self._context_param,
                 agent_name=self.name or "Agent",
+                session_cache=self._session_dedup_cache,  # Share session cache from workflow
+                llm_summarize_fn=self._create_llm_summarize_fn() if self._context_param.llm_summarize else None,
             )
+        elif hasattr(self._context_param, 'auto_compact') and hasattr(self._context_param, 'tool_output_max'):
+            # ContextConfig from YAML - convert to ManagerConfig
+            try:
+                from ..context.models import ContextConfig as _ContextConfig
+                if isinstance(self._context_param, _ContextConfig):
+                    # Build ManagerConfig from ContextConfig fields
+                    manager_config = ManagerConfig(
+                        auto_compact=self._context_param.auto_compact,
+                        compact_threshold=self._context_param.compact_threshold,
+                        strategy=self._context_param.strategy,
+                        output_reserve=self._context_param.output_reserve,
+                        default_tool_output_max=self._context_param.tool_output_max,  # Map field name
+                        protected_tools=list(self._context_param.protected_tools),
+                        keep_recent_turns=self._context_param.keep_recent_turns,
+                        monitor_enabled=self._context_param.monitor.enabled if self._context_param.monitor else False,
+                    )
+                    # Check if llm_summarize is enabled in ContextConfig
+                    llm_summarize_enabled = getattr(self._context_param, 'llm_summarize', False)
+                    if llm_summarize_enabled:
+                        manager_config.llm_summarize = True
+                    self._context_manager = ContextManager(
+                        model=self.llm if isinstance(self.llm, str) else "gpt-4o-mini",
+                        config=manager_config,
+                        agent_name=self.name or "Agent",
+                        session_cache=self._session_dedup_cache,  # Share session cache from workflow
+                        llm_summarize_fn=self._create_llm_summarize_fn() if llm_summarize_enabled else None,
+                    )
+                else:
+                    self._context_manager = None
+            except Exception as e:
+                logging.debug(f"ContextConfig conversion failed: {e}")
+                self._context_manager = None
         elif hasattr(self._context_param, 'process'):
             # Already a ContextManager instance
             self._context_manager = self._context_param
@@ -1214,12 +1572,61 @@ Your Goal: {self.goal}
         self._context_manager = value
         self._context_manager_initialized = True
 
+    def _create_llm_summarize_fn(self) -> Optional[Callable]:
+        """
+        Create an LLM summarization function using the agent's LLM.
+        
+        Returns a function that can be used by the context optimizer to
+        intelligently summarize conversation history.
+        
+        Returns:
+            Callable that takes (messages, max_tokens) and returns summary string,
+            or None if LLM is not available.
+        """
+        def llm_summarize(messages: List[Dict[str, Any]], max_tokens: int = 500) -> str:
+            """Summarize messages using the agent's LLM."""
+            try:
+                # Build summarization prompt
+                conversation_text = "\n".join([
+                    f"{m.get('role', 'unknown')}: {m.get('content', '')[:500]}"
+                    for m in messages if m.get('content')
+                ])
+                
+                prompt = f"""Summarize the following conversation in a concise way that preserves key information, decisions, and context. Keep the summary under {max_tokens} tokens.
+
+Conversation:
+{conversation_text}
+
+Summary:"""
+                
+                # Use agent's LLM to generate summary
+                client = _get_llm_functions()['get_openai_client'](self.llm, self.base_url, self.api_key)
+                model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
+                
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                )
+                
+                return response.choices[0].message.content or "[Summary unavailable]"
+            except Exception as e:
+                logging.debug(f"LLM summarization failed: {e}")
+                return f"[Previous conversation summary - {len(messages)} messages]"
+        
+        return llm_summarize
+
     @property
     def console(self):
-        """Lazily initialize Rich Console only when needed."""
+        """Lazily initialize Rich Console only when needed AND verbose is True."""
+        # Only return console if verbose mode is enabled
+        # This prevents panels from being shown in status/silent modes
+        if not self.verbose:
+            return None
         if self._console is None:
             from rich.console import Console
-            self._console = Console()
+            self._console = _get_console()()
         return self._console
     
     @property
@@ -1293,7 +1700,7 @@ Your Goal: {self.goal}
         """Lazily initialize OpenAI client only when needed."""
         if self.__openai_client is None:
             try:
-                self.__openai_client = get_openai_client(
+                self.__openai_client = _get_llm_functions()['get_openai_client'](
                     api_key=self._openai_api_key, 
                     base_url=self._openai_base_url
                 )
@@ -1313,6 +1720,20 @@ Your Goal: {self.goal}
             import uuid
             self._agent_id = str(uuid.uuid4())
         return self._agent_id
+    
+    @property
+    def display_name(self) -> str:
+        """Safe display name that never returns None.
+        
+        Returns the agent's name if set, otherwise returns 'Agent N' where N is a unique index.
+        Use this for UI display, logging, and string operations where None would cause errors.
+        """
+        if self.name:
+            return self.name
+        # Use unique index for nameless agents
+        if hasattr(self, '_agent_index') and self._agent_index is not None:
+            return f"Agent {self._agent_index}"
+        return "Agent"
     
     def _init_autonomy(self, autonomy: Any, verification_hooks: Optional[List[Any]] = None) -> None:
         """Initialize autonomy features (agent-centric escalation/doom-loop).
@@ -1606,7 +2027,7 @@ Your Goal: {self.goal}
                 print(result.response)
             ```
         """
-        from .handoff import Handoff, HandoffConfig, HandoffResult
+        from .handoff import Handoff, HandoffConfig
         
         handoff_obj = Handoff(
             agent=target_agent,
@@ -1643,7 +2064,7 @@ Your Goal: {self.goal}
                 print(result.response)
             ```
         """
-        from .handoff import Handoff, HandoffConfig, HandoffResult
+        from .handoff import Handoff, HandoffConfig
         
         handoff_obj = Handoff(
             agent=target_agent,
@@ -1720,7 +2141,7 @@ Your Goal: {self.goal}
             return self.tools
             
         # Filter to read-only tools only
-        from ..planning import READ_ONLY_TOOLS, RESTRICTED_TOOLS
+        from ..planning import RESTRICTED_TOOLS
         
         filtered_tools = []
         for tool in self.tools:
@@ -1752,7 +2173,7 @@ Your Goal: {self.goal}
         elif hasattr(self, 'llm') and self.llm:
             model_name = self.llm
         else:
-            model_name = "gpt-5-nano"
+            model_name = "gpt-4o-mini"
         
         return supports_web_search(model_name)
     
@@ -1774,7 +2195,7 @@ Your Goal: {self.goal}
         elif hasattr(self, 'llm') and self.llm:
             model_name = self.llm
         else:
-            model_name = "gpt-5-nano"
+            model_name = "gpt-4o-mini"
         
         return supports_web_fetch(model_name)
     
@@ -2018,7 +2439,7 @@ Your Goal: {self.goal}
         
         Returns:
             The LLM model/instance being used by this agent.
-            - For standard models: returns the model string (e.g., "gpt-5-nano")
+            - For standard models: returns the model string (e.g., "gpt-4o-mini")
             - For custom LLM instances: returns the LLM instance object
             - For provider models: returns the LLM instance object
         """
@@ -2028,7 +2449,7 @@ Your Goal: {self.goal}
             return self.llm
         else:
             # Default fallback
-            return "gpt-5-nano"
+            return "gpt-4o-mini"
 
     def _ensure_knowledge_processed(self):
         """Ensure knowledge is initialized and processed when first accessed."""
@@ -2518,7 +2939,8 @@ Answer:"""
                 retry_prompt = f"{prompt}\n\nNote: Previous response failed validation due to: {guardrail_result.error}. Please provide an improved response."
                 response = self._chat_completion([{"role": "user", "content": retry_prompt}], temperature, tools, task_name=task_name, task_description=task_description, task_id=task_id)
                 if response and response.choices:
-                    current_response = response.choices[0].message.content.strip()
+                    content = response.choices[0].message.content
+                    current_response = content.strip() if content else ""
                 else:
                     raise Exception("Failed to generate retry response")
             except Exception as e:
@@ -2630,7 +3052,98 @@ Your Goal: {self.goal}"""
             self._system_prompt_cache[cache_key] = system_prompt
         return system_prompt
 
-    def _build_messages(self, prompt, temperature=1.0, output_json=None, output_pydantic=None, tools=None):
+    def _build_response_format(self, schema_model):
+        """Build response_format dict for native structured output.
+        
+        Args:
+            schema_model: Pydantic model or dict schema
+            
+        Returns:
+            Dict suitable for response_format parameter, or None if not applicable
+        """
+        if not schema_model:
+            return None
+        
+        def _add_additional_properties_false(schema):
+            """Recursively add additionalProperties: false and required array to all object schemas."""
+            if isinstance(schema, dict):
+                if schema.get('type') == 'object':
+                    schema['additionalProperties'] = False
+                    # Add required array with all property keys (OpenAI strict mode requirement)
+                    if 'properties' in schema:
+                        schema['required'] = list(schema['properties'].keys())
+                # Recurse into properties
+                if 'properties' in schema:
+                    for prop in schema['properties'].values():
+                        _add_additional_properties_false(prop)
+                # Recurse into items (for arrays)
+                if 'items' in schema:
+                    _add_additional_properties_false(schema['items'])
+                # Recurse into $defs
+                if '$defs' in schema:
+                    for def_schema in schema['$defs'].values():
+                        _add_additional_properties_false(def_schema)
+            return schema
+        
+        def _wrap_array_in_object(schema):
+            """Wrap array schema in object since OpenAI requires root type to be object."""
+            if schema.get('type') == 'array':
+                return {
+                    'type': 'object',
+                    'properties': {
+                        'items': schema
+                    },
+                    'required': ['items'],
+                    'additionalProperties': False
+                }
+            return schema
+        
+        # Handle Pydantic model
+        if hasattr(schema_model, 'model_json_schema'):
+            schema = schema_model.model_json_schema()
+            schema = _add_additional_properties_false(schema)
+            schema = _wrap_array_in_object(schema)
+            name = getattr(schema_model, '__name__', 'response')
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": name,
+                    "schema": schema,
+                    "strict": True
+                }
+            }
+        
+        # Handle dict schema (inline JSON schema from YAML)
+        if isinstance(schema_model, dict):
+            schema = schema_model.copy()
+            schema = _add_additional_properties_false(schema)
+            schema = _wrap_array_in_object(schema)
+            return {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "structured_output",
+                    "schema": schema,
+                    "strict": True
+                }
+            }
+        
+        return None
+
+    def _supports_native_structured_output(self):
+        """Check if current model supports native structured output via response_format.
+        
+        Auto-detects based on model capabilities using LiteLLM.
+        
+        Returns:
+            bool: True if model supports response_format with json_schema
+        """
+        try:
+            from ..llm.model_capabilities import supports_structured_outputs
+            return supports_structured_outputs(self.llm)
+        except Exception:
+            return False
+
+    def _build_messages(self, prompt, temperature=1.0, output_json=None, output_pydantic=None, tools=None, use_native_format=False):
         """Build messages list for chat completion.
         
         Args:
@@ -2639,32 +3152,36 @@ Your Goal: {self.goal}"""
             output_json: Optional Pydantic model for JSON output
             output_pydantic: Optional Pydantic model for JSON output (alias)
             tools: Optional list of tools to use (defaults to self.tools)
+            use_native_format: If True, skip text injection (native response_format will be used)
             
         Returns:
-            tuple: (messages list, original prompt)
+            Tuple of (messages list, original prompt)
         """
-        # Build system prompt using the helper method
-        system_prompt = self._build_system_prompt(tools)
+        messages = []
+        original_prompt = None
         
         # Use openai_client's build_messages method if available
         if self._openai_client is not None:
             messages, original_prompt = self._openai_client.build_messages(
                 prompt=prompt,
-                system_prompt=system_prompt,
+                system_prompt=self._build_system_prompt(
+                    tools=tools,
+                ),
                 chat_history=self.chat_history,
-                output_json=output_json,
-                output_pydantic=output_pydantic
+                output_json=None if use_native_format else output_json,
+                output_pydantic=None if use_native_format else output_pydantic
             )
         else:
-            # Fallback implementation for when OpenAI client is not available
-            messages = []
-            
-            # Add system message if provided
+            # Build messages manually
+            system_prompt = self._build_system_prompt(
+                tools=tools,
+            )
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             
             # Add chat history
-            messages.extend(self.chat_history)
+            if self.chat_history:
+                messages.extend(self.chat_history)
             
             # Add user prompt
             if isinstance(prompt, list):
@@ -2674,11 +3191,19 @@ Your Goal: {self.goal}"""
                 messages.append({"role": "user", "content": str(prompt)})
                 original_prompt = str(prompt)
             
-            # Add JSON format instruction if needed
-            if output_json or output_pydantic:
-                model = output_pydantic or output_json
-                json_instruction = f"\nPlease respond with valid JSON matching this schema: {model.model_json_schema()}"
-                messages[-1]["content"] += json_instruction
+            # Add JSON format instruction if needed (only when not using native format)
+            if not use_native_format and (output_json or output_pydantic):
+                schema_model = output_pydantic or output_json
+                # Handle Pydantic model
+                if hasattr(schema_model, 'model_json_schema'):
+                    import json
+                    json_instruction = f"\nPlease respond with valid JSON matching this schema: {json.dumps(schema_model.model_json_schema())}"
+                    messages[-1]["content"] += json_instruction
+                # Handle inline dict schema (Option A from YAML)
+                elif isinstance(schema_model, dict):
+                    import json
+                    json_instruction = f"\nPlease respond with valid JSON matching this schema: {json.dumps(schema_model)}"
+                    messages[-1]["content"] += json_instruction
         
         return messages, original_prompt
 
@@ -2849,8 +3374,11 @@ Your Goal: {self.goal}"""
         """
         logging.debug(f"{self.name} executing tool {function_name} with arguments: {arguments}")
         
+        # NOTE: tool_call callback is triggered by display_tool_call in openai_client.py
+        # Do NOT call it here to avoid duplicate output
+        
         # Set up injection context for tools with Injected parameters
-        from ..tools.injected import AgentState, with_injection_context
+        from ..tools.injected import AgentState
         state = AgentState(
             agent_id=self.name,
             run_id=getattr(self, '_current_run_id', 'unknown'),
@@ -2863,17 +3391,186 @@ Your Goal: {self.goal}"""
         return self._execute_tool_with_context(function_name, arguments, state)
     
     def _execute_tool_with_context(self, function_name, arguments, state):
-        """Execute tool within injection context."""
+        """Execute tool within injection context, with optional output truncation."""
         from ..tools.injected import with_injection_context
+        from ..trace.context_events import get_context_emitter
+        import time as _time
         
-        with with_injection_context(state):
-            return self._execute_tool_impl(function_name, arguments)
+        # Emit tool call start event (zero overhead when not set)
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.tool_call_start(self.name, function_name, arguments)
+        _tool_start_time = _time.time()
+        
+        try:
+            # Trigger BEFORE_TOOL hook
+            from ..hooks import HookEvent, BeforeToolInput
+            before_tool_input = BeforeToolInput(
+                session_id=getattr(self, '_session_id', 'default'),
+                cwd=os.getcwd(),
+                event_name=HookEvent.BEFORE_TOOL,
+                timestamp=str(_time.time()),
+                agent_name=self.name,
+                tool_name=function_name,
+                tool_input=arguments
+            )
+            tool_hook_results = self._hook_runner.execute_sync(HookEvent.BEFORE_TOOL, before_tool_input, target=function_name)
+            if self._hook_runner.is_blocked(tool_hook_results):
+                logging.warning(f"Tool {function_name} execution blocked by BEFORE_TOOL hook")
+                return f"Execution of {function_name} was blocked by security policy."
+            
+            # Update arguments if modified by hooks
+            for res in tool_hook_results:
+                if res.output and res.output.modified_data:
+                    arguments.update(res.output.modified_data)
+
+            with with_injection_context(state):
+                result = self._execute_tool_impl(function_name, arguments)
+            
+            # Apply tool output truncation to prevent context overflow
+            # Uses context manager budget if enabled, otherwise applies default limit
+            if result:
+                try:
+                    result_str = str(result)
+                    
+                    if self.context_manager:
+                        # Use context-aware truncation with configured budget
+                        truncated = self._truncate_tool_output(function_name, result_str)
+                    else:
+                        # Apply default limit even without context management
+                        # This prevents runaway tool outputs from causing overflow
+                        if len(result_str) > DEFAULT_TOOL_OUTPUT_LIMIT:
+                            # Use smart truncation format that judge recognizes as OK
+                            tail_size = min(DEFAULT_TOOL_OUTPUT_LIMIT // 5, 2000)
+                            head = result_str[:DEFAULT_TOOL_OUTPUT_LIMIT - tail_size]
+                            tail = result_str[-tail_size:] if tail_size > 0 else ""
+                            truncated = f"{head}\n...[{len(result_str):,} chars, showing first/last portions]...\n{tail}"
+                        else:
+                            truncated = result_str
+                    
+                    if len(truncated) < len(result_str):
+                        logging.debug(f"Truncated {function_name} output from {len(result_str)} to {len(truncated)} chars")
+                        # For dicts, truncate large string fields (e.g., raw_content from search)
+                        if isinstance(result, dict):
+                            max_field_chars = DEFAULT_TOOL_OUTPUT_LIMIT if not self.context_manager else None
+                            result = self._truncate_dict_fields(result, function_name, max_field_chars)
+                        else:
+                            result = truncated
+                except Exception as e:
+                    logging.debug(f"Tool truncation skipped: {e}")
+            
+            # Emit tool call end event (truncation handled by context_events.py)
+            _duration_ms = (_time.time() - _tool_start_time) * 1000
+            _trace_emitter.tool_call_end(self.name, function_name, str(result) if result else None, _duration_ms)
+            
+            # Trigger AFTER_TOOL hook
+            from ..hooks import HookEvent, AfterToolInput
+            after_tool_input = AfterToolInput(
+                session_id=getattr(self, '_session_id', 'default'),
+                cwd=os.getcwd(),
+                event_name=HookEvent.AFTER_TOOL,
+                timestamp=str(_time.time()),
+                agent_name=self.name,
+                tool_name=function_name,
+                tool_input=arguments,
+                tool_output=result,
+                execution_time_ms=(_time.time() - _tool_start_time) * 1000
+            )
+            self._hook_runner.execute_sync(HookEvent.AFTER_TOOL, after_tool_input, target=function_name)
+            
+            return result
+        except Exception as e:
+            # Emit tool call end with error
+            _duration_ms = (_time.time() - _tool_start_time) * 1000
+            _trace_emitter.tool_call_end(self.name, function_name, None, _duration_ms, str(e))
+            
+            # Trigger OnError hook if needed (optional future step)
+            raise
+            
+    def _trigger_after_agent_hook(self, prompt, response, start_time, tools_used=None):
+        """Trigger AFTER_AGENT hook and return response."""
+        from ..hooks import HookEvent, AfterAgentInput
+        after_agent_input = AfterAgentInput(
+            session_id=getattr(self, '_session_id', 'default'),
+            cwd=os.getcwd(),
+            event_name=HookEvent.AFTER_AGENT,
+            timestamp=str(time.time()),
+            agent_name=self.name,
+            prompt=prompt if isinstance(prompt, str) else str(prompt),
+            response=response or "",
+            tools_used=tools_used or [],
+            total_tokens=0,
+            execution_time_ms=(time.time() - start_time) * 1000
+        )
+        self._hook_runner.execute_sync(HookEvent.AFTER_AGENT, after_agent_input)
+        return response
+
+    
+    def _calculate_llm_cost(self, prompt_tokens: int, completion_tokens: int, response: any = None) -> float:
+        """Calculate estimated cost for LLM call.
+        
+        Uses litellm for accurate pricing (1000+ models) when available,
+        falls back to built-in pricing table otherwise.
+        
+        Args:
+            prompt_tokens: Number of tokens in the prompt
+            completion_tokens: Number of tokens in the completion
+            response: Optional LLM response object for more accurate cost calculation
+            
+        Returns:
+            Estimated cost in USD
+        """
+        from praisonaiagents.utils.cost_utils import calculate_llm_cost
+        return calculate_llm_cost(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            model=self.llm,
+            response=response,
+        )
+    
+    def _truncate_dict_fields(self, data: dict, tool_name: str, max_field_chars: int = None) -> dict:
+        """Truncate large string fields in a dict to prevent context overflow."""
+        if max_field_chars is None:
+            # Use tool budget from context manager (default 5000 tokens * 4 chars/token = 20000 chars)
+            max_tokens = self.context_manager.get_tool_budget(tool_name) if self.context_manager else 5000
+            max_field_chars = max_tokens * 4
+        
+        result = {}
+        for key, value in data.items():
+            if isinstance(value, str) and len(value) > max_field_chars:
+                # Smart truncate large string fields preserving head and tail
+                head_limit = int(max_field_chars * 0.8)
+                tail_limit = int(max_field_chars * 0.15)
+                head = value[:head_limit]
+                tail = value[-tail_limit:] if tail_limit > 0 else ""
+                result[key] = f"{head}\n...[{len(value):,} chars, showing first/last portions]...\n{tail}"
+                logging.debug(f"Smart truncated field '{key}' from {len(value)} to ~{max_field_chars} chars")
+            elif isinstance(value, dict):
+                result[key] = self._truncate_dict_fields(value, tool_name, max_field_chars)
+            elif isinstance(value, list):
+                result[key] = [
+                    self._truncate_dict_fields(item, tool_name, max_field_chars) if isinstance(item, dict)
+                    else (self._smart_truncate_str(item, max_field_chars) if isinstance(item, str) and len(item) > max_field_chars else item)
+                    for item in value
+                ]
+            else:
+                result[key] = value
+        return result
+    
+    def _smart_truncate_str(self, text: str, max_chars: int) -> str:
+        """Smart truncate a string preserving head and tail."""
+        if len(text) <= max_chars:
+            return text
+        head_limit = int(max_chars * 0.8)
+        tail_limit = int(max_chars * 0.15)
+        head = text[:head_limit]
+        tail = text[-tail_limit:] if tail_limit > 0 else ""
+        return f"{head}\n...[{len(text):,} chars, showing first/last portions]...\n{tail}"
     
     def _execute_tool_impl(self, function_name, arguments):
         """Internal tool execution implementation."""
 
         # Check if approval is required for this tool
-        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, ApprovalDecision, get_approval_callback
+        from ..approval import is_approval_required, console_approval_callback, get_risk_level, mark_approved, get_approval_callback
         if is_approval_required(function_name):
             risk_level = get_risk_level(function_name)
             logging.debug(f"Tool {function_name} requires approval (risk level: {risk_level})")
@@ -3032,14 +3729,169 @@ Your Goal: {self.goal}"""
     def clear_history(self):
         self.chat_history = []
 
+    # -------------------------------------------------------------------------
+    #                       History Management Methods
+    # -------------------------------------------------------------------------
+    
+    def prune_history(self, keep_last: int = 5) -> int:
+        """
+        Prune chat history to keep only the last N messages.
+        
+        Useful for cleaning up large history after image analysis sessions
+        to prevent context window saturation.
+        
+        Args:
+            keep_last: Number of recent messages to keep
+            
+        Returns:
+            Number of messages deleted
+        """
+        with self._history_lock:
+            if len(self.chat_history) <= keep_last:
+                return 0
+            
+            deleted_count = len(self.chat_history) - keep_last
+            self.chat_history = self.chat_history[-keep_last:]
+            return deleted_count
+    
+    def delete_history(self, index: int) -> bool:
+        """
+        Delete a specific message from chat history by index.
+        
+        Supports negative indexing (-1 for last message, etc.).
+        
+        Args:
+            index: Message index (0-based, supports negative indexing)
+            
+        Returns:
+            True if deleted, False if index out of range
+        """
+        with self._history_lock:
+            try:
+                del self.chat_history[index]
+                return True
+            except IndexError:
+                return False
+    
+    def delete_history_matching(self, pattern: str) -> int:
+        """
+        Delete all messages matching a pattern.
+        
+        Useful for removing all image-related messages after processing.
+        
+        Args:
+            pattern: Substring to match in message content
+            
+        Returns:
+            Number of messages deleted
+        """
+        with self._history_lock:
+            original_len = len(self.chat_history)
+            self.chat_history = [
+                msg for msg in self.chat_history
+                if pattern.lower() not in msg.get("content", "").lower()
+            ]
+            return original_len - len(self.chat_history)
+    
+    def get_history_size(self) -> int:
+        """Get the current number of messages in chat history."""
+        return len(self.chat_history)
+    
+    @contextlib.contextmanager
+    def ephemeral(self):
+        """
+        Context manager for ephemeral conversations.
+        
+        Messages within this block are NOT permanently stored in chat_history.
+        History is restored to pre-block state after exiting.
+        
+        Example:
+            with agent.ephemeral():
+                response = agent.chat("[IMAGE] Analyze this")
+                # After block, history is restored - image NOT persisted
+        """
+        # Save current history state
+        with self._history_lock:
+            saved_history = self.chat_history.copy()
+        
+        try:
+            yield
+        finally:
+            # Restore history to pre-block state
+            with self._history_lock:
+                self.chat_history = saved_history
+    
+    def _build_multimodal_prompt(
+        self, 
+        prompt: str, 
+        attachments: Optional[List[str]] = None
+    ) -> Union[str, List[Dict[str, Any]]]:
+        """
+        Build a multimodal prompt from text and attachments.
+        
+        This is a DRY helper used by chat/achat/run/arun/start/astart.
+        Attachments are ephemeral - only text is stored in history.
+        
+        Args:
+            prompt: Text query (ALWAYS stored in chat_history)
+            attachments: Image/file paths for THIS turn only (NEVER stored)
+            
+        Returns:
+            Either a string (no attachments) or multimodal message list
+        """
+        if not attachments:
+            return prompt
+        
+        # Build multimodal content list
+        content = [{"type": "text", "text": prompt}]
+        
+        for attachment in attachments:
+            # Handle image files
+            if isinstance(attachment, str):
+                import os
+                import base64
+                
+                if os.path.isfile(attachment):
+                    # File path - read and encode
+                    ext = os.path.splitext(attachment)[1].lower()
+                    if ext in ('.jpg', '.jpeg', '.png', '.gif', '.webp'):
+                        try:
+                            with open(attachment, 'rb') as f:
+                                data = base64.b64encode(f.read()).decode('utf-8')
+                            media_type = {
+                                '.jpg': 'image/jpeg',
+                                '.jpeg': 'image/jpeg',
+                                '.png': 'image/png',
+                                '.gif': 'image/gif',
+                                '.webp': 'image/webp',
+                            }.get(ext, 'image/jpeg')
+                            content.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{media_type};base64,{data}"}
+                            })
+                            logging.debug(f"Successfully encoded image attachment: {attachment} ({len(data)} bytes base64)")
+                        except Exception as e:
+                            logging.warning(f"Failed to load attachment {attachment}: {e}")
+                elif attachment.startswith(('http://', 'https://', 'data:')):
+                    # URL or data URI
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": attachment}
+                    })
+            elif isinstance(attachment, dict):
+                # Already structured content
+                content.append(attachment)
+        
+        return content
+
     def __str__(self):
         return f"Agent(name='{self.name}', role='{self.role}', goal='{self.goal}')"
 
     def _process_stream_response(self, messages, temperature, start_time, formatted_tools=None, reasoning_steps=False):
-        """Process streaming response and return final response"""
+        """Internal helper for streaming response processing with real-time events."""
         if self._openai_client is None:
-            raise ValueError("OpenAI client is not initialized. Please provide OPENAI_API_KEY or use a custom LLM provider.")
-        
+            return None
+            
         return self._openai_client.process_stream_response(
             messages=messages,
             model=self.llm,
@@ -3047,13 +3899,41 @@ Your Goal: {self.goal}"""
             tools=formatted_tools,
             start_time=start_time,
             console=self.console,
-            display_fn=self.display_generating if self.verbose else None,
-            reasoning_steps=reasoning_steps
+            display_fn=_get_display_functions()['display_generating'] if self.verbose else None,
+            reasoning_steps=reasoning_steps,
+            stream_callback=self.stream_emitter.emit,
+            emit_events=True
         )
 
-    def _chat_completion(self, messages, temperature=1.0, tools=None, stream=True, reasoning_steps=False, task_name=None, task_description=None, task_id=None):
+    def _chat_completion(self, messages, temperature=1.0, tools=None, stream=True, reasoning_steps=False, task_name=None, task_description=None, task_id=None, response_format=None):
         start_time = time.time()
+        
+        # Trigger BEFORE_LLM hook
+        from ..hooks import HookEvent, BeforeLLMInput
+        before_llm_input = BeforeLLMInput(
+            session_id=getattr(self, '_session_id', 'default'),
+            cwd=os.getcwd(),
+            event_name=HookEvent.BEFORE_LLM,
+            timestamp=str(time.time()),
+            agent_name=self.name,
+            messages=messages,
+            model=self.llm if isinstance(self.llm, str) else str(self.llm),
+            temperature=temperature
+        )
+        self._hook_runner.execute_sync(HookEvent.BEFORE_LLM, before_llm_input)
+        
         logging.debug(f"{self.name} sending messages to LLM: {messages}")
+        
+        # Emit LLM request trace event (zero overhead when not set)
+        from ..trace.context_events import get_context_emitter
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.llm_request(
+            self.name,
+            messages_count=len(messages),
+            tokens_used=0,  # Estimated before call
+            model=self.llm if isinstance(self.llm, str) else None,
+            messages=messages,  # Include full messages for context replay
+        )
 
         # Use the new _format_tools_for_completion helper method
         formatted_tools = self._format_tools_for_completion(tools)
@@ -3079,7 +3959,7 @@ Your Goal: {self.goal}"""
                         execute_tool_fn=self.execute_tool,
                         agent_name=self.name,
                         agent_role=self.role,
-                        agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
+                        agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
                         task_name=task_name,
                         task_description=task_description,
                         task_id=task_id,
@@ -3089,8 +3969,8 @@ Your Goal: {self.goal}"""
                     # Non-streaming with custom LLM - don't show streaming-like behavior
                     if False:  # Don't use display_generating when stream=False to avoid streaming-like behavior
                         # This block is disabled to maintain consistency with the OpenAI path fix
-                        with Live(
-                            display_generating("", start_time),
+                        with _get_live()(
+                            _get_display_functions()['display_generating']("", start_time),
                             console=self.console,
                             refresh_per_second=4,
                         ) as live:
@@ -3106,7 +3986,7 @@ Your Goal: {self.goal}"""
                                 execute_tool_fn=self.execute_tool,
                                 agent_name=self.name,
                                 agent_role=self.role,
-                                agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
+                                agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
                                 task_name=task_name,
                                 task_description=task_description,
                                 task_id=task_id,
@@ -3125,7 +4005,7 @@ Your Goal: {self.goal}"""
                             execute_tool_fn=self.execute_tool,
                             agent_name=self.name,
                             agent_role=self.role,
-                            agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
+                            agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
                             task_name=task_name,
                             task_description=task_description,
                             task_id=task_id,
@@ -3138,24 +4018,116 @@ Your Goal: {self.goal}"""
                 if self._openai_client is None:
                     raise ValueError("OpenAI client is not initialized. Please provide OPENAI_API_KEY or use a custom LLM provider.")
                 
-                final_response = self._openai_client.chat_completion_with_tools(
-                    messages=messages,
-                    model=self.llm,
-                    temperature=temperature,
-                    tools=formatted_tools,  # Already formatted for OpenAI
-                    execute_tool_fn=self.execute_tool,
-                    stream=stream,
-                    console=self.console if (self.verbose or stream) else None,
-                    display_fn=self.display_generating if self.verbose else None,
-                    reasoning_steps=reasoning_steps,
-                    verbose=self.verbose,
-                    max_iterations=10
-                )
+                # Build kwargs including response_format if provided
+                chat_kwargs = {
+                    "messages": messages,
+                    "model": self.llm,
+                    "temperature": temperature,
+                    "tools": formatted_tools,  # Already formatted for OpenAI
+                    "execute_tool_fn": self.execute_tool,
+                    "stream": stream,
+                    "console": self.console if (self.verbose or stream) else None,
+                    "display_fn": self.display_generating if self.verbose else None,
+                    "reasoning_steps": reasoning_steps,
+                    "verbose": self.verbose,
+                    "max_iterations": 10
+                }
+                if response_format:
+                    chat_kwargs["response_format"] = response_format
+                
+                final_response = self._openai_client.chat_completion_with_tools(**chat_kwargs)
 
+            # Emit LLM response trace event with token usage
+            _duration_ms = (time.time() - start_time) * 1000
+            _prompt_tokens = 0
+            _completion_tokens = 0
+            _cost_usd = 0.0
+            
+            # Extract token usage from response if available
+            if final_response:
+                _usage = getattr(final_response, 'usage', None)
+                if _usage:
+                    _prompt_tokens = getattr(_usage, 'prompt_tokens', 0) or 0
+                    _completion_tokens = getattr(_usage, 'completion_tokens', 0) or 0
+                    # Calculate cost using litellm (if available) or fallback pricing
+                    _cost_usd = self._calculate_llm_cost(_prompt_tokens, _completion_tokens, response=final_response)
+            
+            _trace_emitter.llm_response(
+                self.name,
+                duration_ms=_duration_ms,
+                response_content=str(final_response) if final_response else None,
+                prompt_tokens=_prompt_tokens,
+                completion_tokens=_completion_tokens,
+                cost_usd=_cost_usd,
+            )
+            
+            # Trigger AFTER_LLM hook
+            from ..hooks import HookEvent, AfterLLMInput
+            after_llm_input = AfterLLMInput(
+                session_id=getattr(self, '_session_id', 'default'),
+                cwd=os.getcwd(),
+                event_name=HookEvent.AFTER_LLM,
+                timestamp=str(time.time()),
+                agent_name=self.name,
+                messages=messages,
+                response=str(final_response),
+                model=self.llm if isinstance(self.llm, str) else str(self.llm),
+                latency_ms=(time.time() - start_time) * 1000
+            )
+            self._hook_runner.execute_sync(HookEvent.AFTER_LLM, after_llm_input)
+            
             return final_response
 
         except Exception as e:
-            display_error(f"Error in chat completion: {e}")
+            error_str = str(e).lower()
+            
+            # Check if this is a context overflow error
+            context_overflow_phrases = [
+                "maximum context length",
+                "context window is too long", 
+                "context length exceeded",
+                "context_length_exceeded",
+                "token limit",
+                "too many tokens"
+            ]
+            is_overflow = any(phrase in error_str for phrase in context_overflow_phrases)
+            
+            if is_overflow and self.context_manager:
+                # Attempt overflow recovery with emergency truncation
+                logging.warning(f"[{self.name}] Context overflow detected, attempting recovery...")
+                try:
+                    from ..context.budgeter import get_model_limit
+                    from ..context.tokens import estimate_messages_tokens
+                    
+                    model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
+                    model_limit = get_model_limit(model_name)
+                    target = int(model_limit * 0.7)  # Target 70% of limit for safety
+                    
+                    # Apply emergency truncation
+                    truncated_messages = self.context_manager.emergency_truncate(messages, target)
+                    
+                    logging.info(
+                        f"[{self.name}] Emergency truncation: {estimate_messages_tokens(messages)} -> "
+                        f"{estimate_messages_tokens(truncated_messages)} tokens"
+                    )
+                    
+                    # Retry with truncated messages (recursive call with truncated context)
+                    return self._chat_completion(
+                        truncated_messages, temperature, tools, stream, 
+                        reasoning_steps, task_name, task_description, task_id, response_format
+                    )
+                except Exception as recovery_error:
+                    logging.error(f"[{self.name}] Overflow recovery failed: {recovery_error}")
+            
+            # Emit LLM response trace event on error
+            _duration_ms = (time.time() - start_time) * 1000
+            _trace_emitter.llm_response(
+                self.name,
+                duration_ms=_duration_ms,
+                finish_reason="error",
+                response_content=str(e),  # Include error for context replay
+            )
+            _get_display_functions()['display_error'](f"Error in chat completion: {e}")
             return None
     
     def _execute_callback_and_display(self, prompt: str, response: str, generation_time: float, task_name=None, task_description=None, task_id=None):
@@ -3163,35 +4135,34 @@ Your Goal: {self.goal}"""
         
         This centralizes the logic for callback execution and display to avoid duplication.
         """
-        # Always execute callbacks regardless of verbose setting (only when not using custom LLM)
-        if not self._using_custom_llm:
-            execute_sync_callback(
-                'interaction',
-                message=prompt,
-                response=response,
-                markdown=self.markdown,
-                generation_time=generation_time,
-                agent_name=self.name,
-                agent_role=self.role,
-                agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
-                task_name=task_name,
-                task_description=task_description, 
-                task_id=task_id
-            )
+        # Always execute callbacks for status/trace output (regardless of LLM backend)
+        _get_display_functions()['execute_sync_callback'](
+            'interaction',
+            message=prompt,
+            response=response,
+            markdown=self.markdown,
+            generation_time=generation_time,
+            agent_name=self.name,
+            agent_role=self.role,
+            agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
+            task_name=task_name,
+            task_description=task_description, 
+            task_id=task_id
+        )
         # Always display final interaction when verbose is True to ensure consistent formatting
         # This ensures both OpenAI and custom LLM providers (like Gemini) show formatted output
         if self.verbose and not self._final_display_shown:
-            display_interaction(prompt, response, markdown=self.markdown, 
+            _get_display_functions()['display_interaction'](prompt, response, markdown=self.markdown, 
                               generation_time=generation_time, console=self.console,
                               agent_name=self.name,
                               agent_role=self.role,
-                              agent_tools=[t.__name__ for t in self.tools] if self.tools else None,
+                              agent_tools=[getattr(t, '__name__', str(t)) for t in self.tools] if self.tools else None,
                               task_name=None,  # Not available in this context
                               task_description=None,  # Not available in this context
                               task_id=None)  # Not available in this context
             self._final_display_shown = True
     
-    def display_generating(self, content: str, start_time: float):
+    def _display_generating(self, content: str, start_time: float):
         """Display function for generating animation with agent info."""
         from rich.panel import Panel
         from rich.markdown import Markdown
@@ -3249,6 +4220,8 @@ Your Goal: {self.goal}"""
                 trigger="turn",
             )
             
+            optimized = result.get("messages", messages)
+            
             # Log if optimization occurred
             if result.get("optimized"):
                 logging.debug(
@@ -3257,7 +4230,29 @@ Your Goal: {self.goal}"""
                     f"(saved {result.get('tokens_saved', 0)})"
                 )
             
-            return result.get("messages", messages), result
+            # HARD LIMIT CHECK: If still over model limit, apply emergency truncation
+            try:
+                from ..context.budgeter import get_model_limit
+                from ..context.tokens import estimate_messages_tokens
+                
+                model_name = self.llm if isinstance(self.llm, str) else "gpt-4o-mini"
+                model_limit = get_model_limit(model_name)
+                current_tokens = estimate_messages_tokens(optimized)
+                
+                # If over 95% of limit, apply emergency truncation
+                if current_tokens > model_limit * 0.95:
+                    logging.warning(
+                        f"[{self.name}] Context at {current_tokens} tokens (limit: {model_limit}), "
+                        f"applying emergency truncation"
+                    )
+                    target = int(model_limit * 0.8)  # Target 80% of limit
+                    optimized = self.context_manager.emergency_truncate(optimized, target)
+                    result["emergency_truncated"] = True
+                    result["tokens_after"] = estimate_messages_tokens(optimized)
+            except Exception as e:
+                logging.debug(f"Hard limit check skipped: {e}")
+            
+            return optimized, result
             
         except Exception as e:
             # Context management should never break the chat flow
@@ -3433,10 +4428,52 @@ Your Goal: {self.goal}"""
         """Get the current session ID."""
         return self._session_id
 
-    def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None, config=None, force_retrieval=False, skip_retrieval=False):
+    def chat(self, prompt, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, stream=None, task_name=None, task_description=None, task_id=None, config=None, force_retrieval=False, skip_retrieval=False, attachments=None, tool_choice=None):
+        """
+        Chat with the agent.
+        
+        Args:
+            prompt: Text query that WILL be stored in chat_history
+            attachments: Optional list of image/file paths that are ephemeral
+                        (used for THIS turn only, NEVER stored in history).
+                        Supports: file paths, URLs, or data URIs.
+            tool_choice: Optional tool choice mode ('auto', 'required', 'none').
+                        'required' forces the LLM to call a tool before responding.
+            ...other args...
+        """
+        # Emit context trace event (zero overhead when not set)
+        from ..trace.context_events import get_context_emitter
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.agent_start(self.name, {"role": self.role, "goal": self.goal})
+        
+        try:
+            return self._chat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice)
+        finally:
+            _trace_emitter.agent_end(self.name)
+    
+    def _chat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, stream, task_name, task_description, task_id, config, force_retrieval, skip_retrieval, attachments, _trace_emitter, tool_choice=None):
+        """Internal chat implementation (extracted for trace wrapping)."""
         # Apply rate limiter if configured (before any LLM call)
         if self._rate_limiter is not None:
             self._rate_limiter.acquire()
+        
+        # Process ephemeral attachments (DRY - builds multimodal prompt)
+        # IMPORTANT: Original text 'prompt' is stored in history, attachments are NOT
+        llm_prompt = self._build_multimodal_prompt(prompt, attachments) if attachments else prompt
+        
+        # Apply response template if configured (DRY: TemplateConfig.response is canonical,
+        # OutputConfig.template is fallback for backward compatibility)
+        effective_template = self.response_template or self._output_template
+        if effective_template:
+            template_instruction = f"\n\nIMPORTANT: Format your response according to this template:\n{effective_template}"
+            if isinstance(llm_prompt, str):
+                llm_prompt = llm_prompt + template_instruction
+            elif isinstance(llm_prompt, list):
+                # For multimodal prompts, append to the last text content
+                for i in range(len(llm_prompt) - 1, -1, -1):
+                    if isinstance(llm_prompt[i], dict) and llm_prompt[i].get('type') == 'text':
+                        llm_prompt[i]['text'] = llm_prompt[i]['text'] + template_instruction
+                        break
         
         # Initialize DB session on first chat (lazy)
         self._init_db_session()
@@ -3448,7 +4485,30 @@ Your Goal: {self.goal}"""
         # Start a new run for this chat turn
         prompt_str = prompt if isinstance(prompt, str) else str(prompt)
         self._start_run(prompt_str)
+
+        # Trigger BEFORE_AGENT hook
+        from ..hooks import HookEvent, BeforeAgentInput
+        before_agent_input = BeforeAgentInput(
+            session_id=getattr(self, '_session_id', 'default'),
+            cwd=os.getcwd(),
+            event_name=HookEvent.BEFORE_AGENT,
+            timestamp=str(time.time()),
+            agent_name=self.name,
+            prompt=prompt_str,
+            conversation_history=self.chat_history,
+            tools_available=[t.__name__ if hasattr(t, '__name__') else str(t) for t in self.tools]
+        )
+        hook_results = self._hook_runner.execute_sync(HookEvent.BEFORE_AGENT, before_agent_input)
+        if self._hook_runner.is_blocked(hook_results):
+            logging.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
+            return None
         
+        # Update prompt if modified by hooks
+        for res in hook_results:
+            if res.output and res.output.modified_data and "prompt" in res.output.modified_data:
+                prompt = res.output.modified_data["prompt"]
+                llm_prompt = self._build_multimodal_prompt(prompt, attachments) if attachments else prompt
+
         # Reset the final display flag for each new conversation
         self._final_display_shown = False
         
@@ -3582,30 +4642,40 @@ Your Goal: {self.goal}"""
                     )
                     
                     # Pass everything to LLM class
-                    response_text = self.llm_instance.get_response(
-                    prompt=prompt,
-                    system_prompt=system_prompt_for_llm,
-                    chat_history=processed_history,
-                    temperature=temperature,
-                    tools=tool_param,
-                    output_json=output_json,
-                    output_pydantic=output_pydantic,
-                    verbose=self.verbose,
-                    markdown=self.markdown,
-                    self_reflect=self.self_reflect,
-                    max_reflect=self.max_reflect,
-                    min_reflect=self.min_reflect,
-                    console=self.console,
-                    agent_name=self.name,
-                    agent_role=self.role,
-                    agent_tools=[t.__name__ if hasattr(t, '__name__') else str(t) for t in (tools if tools is not None else self.tools)],
-                    task_name=task_name,
-                    task_description=task_description,
-                    task_id=task_id,
-                    execute_tool_fn=self.execute_tool,  # Pass tool execution function
-                    reasoning_steps=reasoning_steps,
-                    stream=stream  # Pass the stream parameter from chat method
+                    # Use llm_prompt (which includes multimodal content if attachments present)
+                    # Build LLM call kwargs
+                    llm_kwargs = dict(
+                        prompt=llm_prompt,
+                        system_prompt=system_prompt_for_llm,
+                        chat_history=processed_history,
+                        temperature=temperature,
+                        tools=tool_param,
+                        output_json=output_json,
+                        output_pydantic=output_pydantic,
+                        verbose=self.verbose,
+                        markdown=self.markdown,
+                        reflection=self.self_reflect,
+                        max_reflect=self.max_reflect,
+                        min_reflect=self.min_reflect,
+                        console=self.console,
+                        agent_name=self.name,
+                        agent_role=self.role,
+                        agent_tools=[t.__name__ if hasattr(t, '__name__') else str(t) for t in (tools if tools is not None else self.tools)],
+                        task_name=task_name,
+                        task_description=task_description,
+                        task_id=task_id,
+                        execute_tool_fn=self.execute_tool,
+                        reasoning_steps=reasoning_steps,
+                        stream=stream
                     )
+                    
+                    # Pass tool_choice if specified (auto, required, none)
+                    # Also check for YAML-configured tool_choice on the agent
+                    effective_tool_choice = tool_choice or getattr(self, '_yaml_tool_choice', None)
+                    if effective_tool_choice:
+                        llm_kwargs['tool_choice'] = effective_tool_choice
+                    
+                    response_text = self.llm_instance.get_response(**llm_kwargs)
 
                     self.chat_history.append({"role": "assistant", "content": response_text})
                     # Persist assistant message to DB
@@ -3621,7 +4691,7 @@ Your Goal: {self.goal}"""
                         validated_response = self._apply_guardrail_with_retry(response_text, prompt, temperature, tools, task_name, task_description, task_id)
                         # Execute callback and display after validation
                         self._execute_callback_and_display(prompt, validated_response, time.time() - start_time, task_name, task_description, task_id)
-                        return validated_response
+                        return self._trigger_after_agent_hook(prompt, validated_response, start_time)
                     except Exception as e:
                         logging.error(f"Agent {self.name}: Guardrail validation failed for custom LLM: {e}")
                         # Rollback chat history on guardrail failure
@@ -3630,14 +4700,30 @@ Your Goal: {self.goal}"""
                 except Exception as e:
                     # Rollback chat history if LLM call fails
                     self.chat_history = self.chat_history[:chat_history_length]
-                    display_error(f"Error in LLM chat: {e}")
+                    _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
                     return None
             except Exception as e:
-                display_error(f"Error in LLM chat: {e}")
+                _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
                 return None
         else:
+            # Determine if we should use native structured output
+            schema_model = output_pydantic or output_json
+            use_native_format = False
+            response_format = None
+            
+            if schema_model and self._supports_native_structured_output():
+                # Model supports native structured output - build response_format
+                response_format = self._build_response_format(schema_model)
+                if response_format:
+                    use_native_format = True
+                    logging.debug(f"Agent {self.name} using native structured output with response_format")
+            
             # Use the new _build_messages helper method
-            messages, original_prompt = self._build_messages(prompt, temperature, output_json, output_pydantic)
+            # Pass llm_prompt (which includes multimodal content if attachments present)
+            messages, original_prompt = self._build_messages(
+                llm_prompt, temperature, output_json, output_pydantic,
+                use_native_format=use_native_format
+            )
             
             # Store chat history length for potential rollback
             chat_history_length = len(self.chat_history)
@@ -3685,7 +4771,7 @@ Your Goal: {self.goal}"""
                             if display_text and str(display_text).strip():
                                 # Pass agent information to display_instruction
                                 agent_tools = [t.__name__ if hasattr(t, '__name__') else str(t) for t in self.tools]
-                                display_instruction(
+                                _get_display_functions()['display_instruction'](
                                     f"Agent {self.name} is processing prompt: {display_text}", 
                                     console=self.console,
                                     agent_name=self.name,
@@ -3693,13 +4779,15 @@ Your Goal: {self.goal}"""
                                     agent_tools=agent_tools
                                 )
 
-                        response = self._chat_completion(messages, temperature=temperature, tools=tools if tools else None, reasoning_steps=reasoning_steps, stream=stream, task_name=task_name, task_description=task_description, task_id=task_id)
+                        response = self._chat_completion(messages, temperature=temperature, tools=tools if tools else None, reasoning_steps=reasoning_steps, stream=stream, task_name=task_name, task_description=task_description, task_id=task_id, response_format=response_format)
                         if not response:
                             # Rollback chat history on response failure
                             self.chat_history = self.chat_history[:chat_history_length]
                             return None
 
-                        response_text = response.choices[0].message.content.strip()
+                        # Handle None content (can happen with tool calls or empty responses)
+                        content = response.choices[0].message.content
+                        response_text = content.strip() if content else ""
 
                         # Handle output_json or output_pydantic if specified
                         if output_json or output_pydantic:
@@ -3728,13 +4816,13 @@ Your Goal: {self.goal}"""
                             if self.verbose:
                                 logging.debug(f"Agent {self.name} final response: {response_text}")
                             # Return only reasoning content if reasoning_steps is True
-                            if reasoning_steps and hasattr(response.choices[0].message, 'reasoning_content'):
+                            if reasoning_steps and hasattr(response.choices[0].message, 'reasoning_content') and response.choices[0].message.reasoning_content:
                                 # Apply guardrail to reasoning content
                                 try:
                                     validated_reasoning = self._apply_guardrail_with_retry(response.choices[0].message.reasoning_content, original_prompt, temperature, tools, task_name, task_description, task_id)
                                     # Execute callback after validation
                                     self._execute_callback_and_display(original_prompt, validated_reasoning, time.time() - start_time, task_name, task_description, task_id)
-                                    return validated_reasoning
+                                    return self._trigger_after_agent_hook(original_prompt, validated_reasoning, start_time)
                                 except Exception as e:
                                     logging.error(f"Agent {self.name}: Guardrail validation failed for reasoning content: {e}")
                                     # Rollback chat history on guardrail failure
@@ -3771,7 +4859,8 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                 if not reflection_response or not reflection_response.choices:
                                     raise Exception("No response from reflection request")
                                 
-                                reflection_text = reflection_response.choices[0].message.content.strip()
+                                reflection_content = reflection_response.choices[0].message.content
+                                reflection_text = reflection_content.strip() if reflection_content else ""
                                 
                                 # Clean the JSON output
                                 cleaned_json = self.clean_json_output(reflection_text)
@@ -3785,27 +4874,27 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         self.reflection = data.get('reflection', '')
                                         self.satisfactory = data.get('satisfactory', 'no').lower()
                                 
-                                reflection_output = CustomReflectionOutput(reflection_data)
+                                reflection_output = _get_display_functions()['ReflectionOutput'](reflection_data)
                             else:
                                 # Use OpenAI's structured output for OpenAI models
                                 reflection_response = self._openai_client.sync_client.beta.chat.completions.parse(
                                     model=self.reflect_llm if self.reflect_llm else self.llm,
                                     messages=messages,
                                     temperature=temperature,
-                                    response_format=ReflectionOutput
+                                    response_format=_get_display_functions()['ReflectionOutput']
                                 )
 
                                 reflection_output = reflection_response.choices[0].message.parsed
 
                             if self.verbose:
-                                display_self_reflection(f"Agent {self.name} self reflection (using {self.reflect_llm if self.reflect_llm else self.llm}): reflection='{reflection_output.reflection}' satisfactory='{reflection_output.satisfactory}'", console=self.console)
+                                _get_display_functions()['display_self_reflection'](f"Agent {self.name} self reflection (using {self.reflect_llm if self.reflect_llm else self.llm}): reflection='{reflection_output.reflection}' satisfactory='{reflection_output.satisfactory}'", console=self.console)
 
                             messages.append({"role": "assistant", "content": f"Self Reflection: {reflection_output.reflection} Satisfactory?: {reflection_output.satisfactory}"})
 
                             # Only consider satisfactory after minimum reflections
                             if reflection_output.satisfactory == "yes" and reflection_count >= self.min_reflect - 1:
                                 if self.verbose:
-                                    display_self_reflection("Agent marked the response as satisfactory after meeting minimum reflections", console=self.console)
+                                    _get_display_functions()['display_self_reflection']("Agent marked the response as satisfactory after meeting minimum reflections", console=self.console)
                                 # User message already added before LLM call via _build_messages
                                 self.chat_history.append({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after satisfactory reflection
@@ -3825,7 +4914,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             # Check if we've hit max reflections
                             if reflection_count >= self.max_reflect - 1:
                                 if self.verbose:
-                                    display_self_reflection("Maximum reflection count reached, returning current response", console=self.console)
+                                    _get_display_functions()['display_self_reflection']("Maximum reflection count reached, returning current response", console=self.console)
                                 # User message already added before LLM call via _build_messages
                                 self.chat_history.append({"role": "assistant", "content": response_text})
                                 # Apply guardrail validation after max reflections
@@ -3846,12 +4935,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             # For custom LLMs during reflection, always use non-streaming to ensure complete responses
                             use_stream = self.stream if not self._using_custom_llm else False
                             response = self._chat_completion(messages, temperature=temperature, tools=None, stream=use_stream, task_name=task_name, task_description=task_description, task_id=task_id)
-                            response_text = response.choices[0].message.content.strip()
+                            content = response.choices[0].message.content
+                            response_text = content.strip() if content else ""
                             reflection_count += 1
                             continue  # Continue the loop for more reflections
 
                         except Exception as e:
-                                display_error(f"Error in parsing self-reflection json {e}. Retrying", console=self.console)
+                                _get_display_functions()['display_error'](f"Error in parsing self-reflection json {e}. Retrying", console=self.console)
                                 logging.error("Reflection parsing failed.", exc_info=True)
                                 messages.append({"role": "assistant", "content": "Self Reflection failed."})
                                 reflection_count += 1
@@ -3861,7 +4951,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         raise
             except Exception as e:
                 # Catch any exceptions that escape the while loop
-                display_error(f"Unexpected error in chat: {e}", console=self.console)
+                _get_display_functions()['display_error'](f"Unexpected error in chat: {e}", console=self.console)
                 # Rollback chat history
                 self.chat_history = self.chat_history[:chat_history_length]
                 return None
@@ -3878,8 +4968,57 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
             cleaned = cleaned[:-3].strip()
         return cleaned  
 
-    async def achat(self, prompt: str, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None):
-        """Async version of chat method with self-reflection support.""" 
+    async def achat(self, prompt: str, temperature=1.0, tools=None, output_json=None, output_pydantic=None, reasoning_steps=False, task_name=None, task_description=None, task_id=None, attachments=None):
+        """Async version of chat method with self-reflection support.
+        
+        Args:
+            prompt: Text query that WILL be stored in chat_history
+            attachments: Optional list of image/file paths that are ephemeral
+                        (used for THIS turn only, NEVER stored in history).
+        """
+        # Emit context trace event (zero overhead when not set)
+        from ..trace.context_events import get_context_emitter
+        _trace_emitter = get_context_emitter()
+        _trace_emitter.agent_start(self.name, {"role": self.role, "goal": self.goal})
+        
+        try:
+            return await self._achat_impl(prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, task_name, task_description, task_id, attachments, _trace_emitter)
+        finally:
+            _trace_emitter.agent_end(self.name)
+    
+    async def _achat_impl(self, prompt, temperature, tools, output_json, output_pydantic, reasoning_steps, task_name, task_description, task_id, attachments, _trace_emitter):
+        """Internal async chat implementation (extracted for trace wrapping)."""
+        # Process ephemeral attachments (DRY - builds multimodal prompt)
+        # IMPORTANT: Original text 'prompt' is stored in history, attachments are NOT
+        llm_prompt = self._build_multimodal_prompt(prompt, attachments) if attachments else prompt
+        
+        # Trigger BEFORE_AGENT hook
+        from ..hooks import HookEvent, BeforeAgentInput
+        before_agent_input = BeforeAgentInput(
+            session_id=getattr(self, '_session_id', 'default'),
+            cwd=os.getcwd(),
+            event_name=HookEvent.BEFORE_AGENT,
+            timestamp=str(time.time()),
+            agent_name=self.name,
+            prompt=prompt if isinstance(prompt, str) else str(prompt),
+            conversation_history=self.chat_history,
+            tools_available=[t.__name__ if hasattr(t, '__name__') else str(t) for t in (tools or self.tools)]
+        )
+        hook_results = await self._hook_runner.execute(HookEvent.BEFORE_AGENT, before_agent_input)
+        if self._hook_runner.is_blocked(hook_results):
+            logging.warning(f"Agent {self.name} execution blocked by BEFORE_AGENT hook")
+            return None
+            
+        # Update prompt if modified by hooks
+        for res in hook_results:
+            if res.output and res.output.modified_data and "prompt" in res.output.modified_data:
+                prompt = res.output.modified_data["prompt"]
+                llm_prompt = self._build_multimodal_prompt(prompt, attachments) if attachments else prompt
+        
+        # Track execution via telemetry
+        if hasattr(self, '_telemetry') and self._telemetry:
+            self._telemetry.track_agent_execution(self.name, success=True)
+            
         # Reset the final display flag for each new conversation
         self._final_display_shown = False
         
@@ -3946,7 +5085,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         output_pydantic=output_pydantic,
                         verbose=self.verbose,
                         markdown=self.markdown,
-                        self_reflect=self.self_reflect,
+                        reflection=self.self_reflect,
                         max_reflect=self.max_reflect,
                         min_reflect=self.min_reflect,
                         console=self.console,
@@ -3980,7 +5119,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 except Exception as e:
                     # Rollback chat history if LLM call fails
                     self.chat_history = self.chat_history[:chat_history_length]
-                    display_error(f"Error in LLM chat: {e}")
+                    _get_display_functions()['display_error'](f"Error in LLM chat: {e}")
                     if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
                         logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
@@ -4018,7 +5157,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         if display_text and str(display_text).strip():
                             agent_tools = [t.__name__ if hasattr(t, '__name__') else str(t) for t in self.tools]
-                            await adisplay_instruction(
+                            await _get_display_functions()['adisplay_instruction'](
                                 f"Agent {self.name} is processing prompt: {display_text}",
                                 console=self.console,
                                 agent_name=self.name,
@@ -4032,7 +5171,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # Check if OpenAI client is available
                     if self._openai_client is None:
                         error_msg = "OpenAI client is not initialized. Please provide OPENAI_API_KEY or use a custom LLM provider."
-                        display_error(error_msg)
+                        _get_display_functions()['display_error'](error_msg)
                         return None
 
                     # Make the API call based on the type of request
@@ -4096,7 +5235,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     if self._openai_client is None:
                                         # For custom LLMs, self-reflection with structured output is not supported
                                         if self.verbose:
-                                            display_self_reflection(f"Agent {self.name}: Self-reflection with structured output is not supported for custom LLM providers. Skipping reflection.", console=self.console)
+                                            _get_display_functions()['display_self_reflection'](f"Agent {self.name}: Self-reflection with structured output is not supported for custom LLM providers. Skipping reflection.", console=self.console)
                                         # Return the original response without reflection
                                         self.chat_history.append({"role": "user", "content": original_prompt})
                                         self.chat_history.append({"role": "assistant", "content": response_text})
@@ -4109,24 +5248,24 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                         model=self.reflect_llm if self.reflect_llm else self.llm,
                                         messages=reflection_messages,
                                         temperature=temperature,
-                                        response_format=ReflectionOutput
+                                        response_format=_get_display_functions()['ReflectionOutput']
                                     )
                                     
                                     reflection_output = reflection_response.choices[0].message.parsed
                                     
                                     if self.verbose:
-                                        display_self_reflection(f"Agent {self.name} self reflection (using {self.reflect_llm if self.reflect_llm else self.llm}): reflection='{reflection_output.reflection}' satisfactory='{reflection_output.satisfactory}'", console=self.console)
+                                        _get_display_functions()['display_self_reflection'](f"Agent {self.name} self reflection (using {self.reflect_llm if self.reflect_llm else self.llm}): reflection='{reflection_output.reflection}' satisfactory='{reflection_output.satisfactory}'", console=self.console)
                                     
                                     # Only consider satisfactory after minimum reflections
                                     if reflection_output.satisfactory == "yes" and reflection_count >= self.min_reflect - 1:
                                         if self.verbose:
-                                            display_self_reflection("Agent marked the response as satisfactory after meeting minimum reflections", console=self.console)
+                                            _get_display_functions()['display_self_reflection']("Agent marked the response as satisfactory after meeting minimum reflections", console=self.console)
                                         break
                                     
                                     # Check if we've hit max reflections
                                     if reflection_count >= self.max_reflect - 1:
                                         if self.verbose:
-                                            display_self_reflection("Maximum reflection count reached, returning current response", console=self.console)
+                                            _get_display_functions()['display_self_reflection']("Maximum reflection count reached, returning current response", console=self.console)
                                         break
                                     
                                     # Regenerate response based on reflection
@@ -4145,7 +5284,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                                     
                                 except Exception as e:
                                     if self.verbose:
-                                        display_error(f"Error in parsing self-reflection json {e}. Retrying", console=self.console)
+                                        _get_display_functions()['display_error'](f"Error in parsing self-reflection json {e}. Retrying", console=self.console)
                                     logging.error("Reflection parsing failed.", exc_info=True)
                                     reflection_count += 1
                                     if reflection_count >= self.max_reflect:
@@ -4168,13 +5307,13 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                             self.chat_history = self.chat_history[:chat_history_length]
                             return None
                 except Exception as e:
-                    display_error(f"Error in chat completion: {e}")
+                    _get_display_functions()['display_error'](f"Error in chat completion: {e}")
                     if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
                         total_time = time.time() - start_time
                         logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
                     return None
         except Exception as e:
-            display_error(f"Error in achat: {e}")
+            _get_display_functions()['display_error'](f"Error in achat: {e}")
             if logging.getLogger().getEffectiveLevel() == logging.DEBUG:
                 total_time = time.time() - start_time
                 logging.debug(f"Agent.achat failed in {total_time:.2f} seconds: {str(e)}")
@@ -4201,7 +5340,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     # Find the matching tool
                     tool = next((t for t in tools if t.__name__ == function_name), None)
                     if not tool:
-                        display_error(f"Tool {function_name} not found")
+                        _get_display_functions()['display_error'](f"Tool {function_name} not found")
                         continue
                     
                     # Check if the tool is async
@@ -4214,7 +5353,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     
                     results.append(result)
                 except Exception as e:
-                    display_error(f"Error executing tool {function_name}: {e}")
+                    _get_display_functions()['display_error'](f"Error executing tool {function_name}: {e}")
                     results.append(None)
 
             # If we have results, format them into a response
@@ -4251,32 +5390,115 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         self.console.print()
                         
-                        final_response = process_stream_chunks(chunks)
+                        final_response = _get_llm_functions()['process_stream_chunks'](chunks)
                         # Return only reasoning content if reasoning_steps is True
-                        if reasoning_steps and hasattr(final_response.choices[0].message, 'reasoning_content'):
+                        if reasoning_steps and hasattr(final_response.choices[0].message, 'reasoning_content') and final_response.choices[0].message.reasoning_content:
                             return final_response.choices[0].message.reasoning_content
                         return final_response.choices[0].message.content if final_response else full_response_text
 
                     except Exception as e:
-                        display_error(f"Error in final chat completion: {e}")
+                        _get_display_functions()['display_error'](f"Error in final chat completion: {e}")
                         return formatted_results
                 return formatted_results
             return None
         except Exception as e:
-            display_error(f"Error in _achat_completion: {e}")
+            _get_display_functions()['display_error'](f"Error in _achat_completion: {e}")
             return None
 
     async def arun(self, prompt: str, **kwargs):
-        """Async alias for astart() method"""
-        return await self.astart(prompt, **kwargs)
+        """Async version of run() - silent, non-streaming, returns structured result.
+        
+        Production-friendly async execution. Does not stream or display output.
+        
+        Args:
+            prompt: The input prompt to process
+            **kwargs: Additional arguments passed to achat()
+            
+        Returns:
+            The agent's response as a string
+        """
+        # Remove stream from kwargs since achat() doesn't accept it
+        kwargs.pop('stream', None)
+        return await self.achat(prompt, **kwargs)
 
     async def astart(self, prompt: str, **kwargs):
-        """Async version of start method"""
+        """Async version of start() - interactive, streaming-aware.
+        
+        Beginner-friendly async execution. Streams by default when in TTY.
+        
+        Args:
+            prompt: The input prompt to process
+            **kwargs: Additional arguments passed to achat()
+            
+        Returns:
+            The agent's response as a string
+        """
+        import sys
+        
+        # Determine streaming behavior (same logic as start())
+        stream_requested = kwargs.get('stream')
+        if stream_requested is None:
+            if getattr(self, 'stream', None) is not None:
+                stream_requested = self.stream
+            else:
+                stream_requested = sys.stdout.isatty()
+        
+        kwargs['stream'] = stream_requested
         return await self.achat(prompt, **kwargs)
 
     def run(self, prompt: str, **kwargs):
-        """Alias for start() method"""
-        return self.start(prompt, **kwargs)
+        """Execute agent silently and return structured result.
+        
+        Production-friendly execution. Always uses silent mode with no streaming
+        or verbose display, regardless of TTY status. Use this for programmatic,
+        scripted, or automated usage where you want just the result.
+        
+        Args:
+            prompt: The input prompt to process
+            **kwargs: Additional arguments:
+                - stream (bool): Force streaming if True. Default: False
+                - output (str): Output preset override (rarely needed)
+                
+        Returns:
+            The agent's response as a string
+            
+        Example:
+            ```python
+            agent = Agent(instructions="You are helpful")
+            result = agent.run("What is 2+2?")  # Silent, returns "4"
+            print(result)
+            ```
+            
+        Note:
+            Unlike .start() which enables verbose output in TTY for interactive
+            use, .run() is always silent. This makes it suitable for:
+            - Production pipelines
+            - Automated scripts
+            - Background processing
+            - API endpoints
+        """
+        # Production defaults: no streaming, no display
+        if 'stream' not in kwargs:
+            kwargs['stream'] = False
+        
+        # Substitute dynamic variables ({{today}}, {{now}}, {{uuid}}, etc.)
+        if prompt and "{{" in prompt:
+            from praisonaiagents.utils.variables import substitute_variables
+            prompt = substitute_variables(prompt, {})
+        
+        # Load history context
+        self._load_history_context()
+        
+        # Check if planning mode is enabled
+        if self.planning:
+            result = self._start_with_planning(prompt, **kwargs)
+        else:
+            result = self.chat(prompt, **kwargs)
+        
+        # Auto-save session if enabled
+        self._auto_save_session()
+        
+        return result
     
     def _get_planning_agent(self):
         """Lazy load PlanningAgent for planning mode."""
@@ -4296,7 +5518,7 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
         from rich.panel import Panel
         from rich.markdown import Markdown
         
-        console = Console()
+        console = _get_console()()
         
         # Step 1: Create the plan
         console.print("\n[bold blue]📋 PLANNING PHASE[/bold blue]")
@@ -4410,26 +5632,303 @@ Write the complete compiled report:"""
         
         # Chat history is preserved in self.chat_history (no action needed)
 
-    def start(self, prompt: str, **kwargs):
-        """Start the agent with a prompt. This is a convenience method that wraps chat()."""
-        # Load history from past sessions (now handled via context= param)
+    def start(self, prompt: str = None, **kwargs):
+        """Start the agent interactively with verbose output.
+        
+        Beginner-friendly execution. Defaults to verbose output with streaming
+        when running in a TTY. Use this for interactive/terminal usage where 
+        you want to see output in real-time with rich formatting.
+        
+        Args:
+            prompt: The input prompt to process. If not provided, uses the 
+                    agent's instructions as the task (useful when instructions
+                    already describe what the agent should do).
+            **kwargs: Additional arguments:
+                - stream (bool | None): Override streaming. None = auto-detect TTY
+                - output (str): Output preset override (e.g., "silent", "verbose")
+                
+        Returns:
+            - If streaming: Generator yielding response chunks
+            - If not streaming: The complete response as a string
+            
+        Example:
+            ```python
+            # Minimal usage - instructions IS the task
+            agent = Agent(instructions="Research AI trends and summarize")
+            result = agent.start()  # Uses instructions as task
+            
+            # With explicit prompt (overrides/adds to instructions)
+            agent = Agent(instructions="You are a helpful assistant")
+            result = agent.start("What is 2+2?")  # Uses prompt as task
+            ```
+            
+        Note:
+            Unlike .run() which is always silent (production use), .start()
+            enables verbose output by default when in a TTY for beginner-friendly
+            interactive use. Use .run() for programmatic/scripted usage.
+        """
+        import sys
+        
+        # If no prompt provided, use instructions as the task
+        if prompt is None:
+            prompt = self.instructions or "Hello"
+        
+        # Substitute dynamic variables ({{today}}, {{now}}, {{uuid}}, etc.)
+        if prompt and "{{" in prompt:
+            from praisonaiagents.utils.variables import substitute_variables
+            prompt = substitute_variables(prompt, {})
+        
+        # Load history from past sessions
         self._load_history_context()
         
-        # Check if planning mode is enabled
-        if self.planning:
-            result = self._start_with_planning(prompt, **kwargs)
-        elif kwargs.get('stream', getattr(self, 'stream', False)):
-            # Return a generator for streaming response
-            result = self._start_stream(prompt, **kwargs)
-        else:
-            # Return regular chat response for backward compatibility
-            kwargs['stream'] = False
-            result = self.chat(prompt, **kwargs)
+        # Determine if we're in an interactive TTY
+        is_tty = sys.stdout.isatty()
+        
+        # Determine streaming behavior
+        # Priority: explicit kwarg > agent's stream attribute > TTY detection
+        stream_requested = kwargs.get('stream')
+        if stream_requested is None:
+            # Check agent's stream attribute first
+            if getattr(self, 'stream', None) is not None:
+                stream_requested = self.stream
+            else:
+                # Auto-detect: stream if stdout is a TTY (interactive terminal)
+                stream_requested = is_tty
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # Enable verbose output in TTY for beginner-friendly interactive use
+        # Priority: agent's explicit output config > start() override > TTY auto
+        # ─────────────────────────────────────────────────────────────────────
+        original_verbose = self.verbose
+        original_markdown = self.markdown
+        output_override = kwargs.pop('output', None)  # Pop to prevent passing to chat()
+        
+        # Check if agent was configured with explicit output mode (not default)
+        # If so, respect it and don't auto-enable verbose for TTY
+        has_explicit_output = getattr(self, '_has_explicit_output_config', False)
+        
+        try:
+            # Apply output override from start() call if provided
+            if output_override:
+                # Apply explicit output preset for this call
+                from ..config.presets import OUTPUT_PRESETS
+                if output_override in OUTPUT_PRESETS:
+                    preset = OUTPUT_PRESETS[output_override]
+                    self.verbose = preset.get('verbose', False)
+                    self.markdown = preset.get('markdown', False)
+            # Only auto-enable verbose for TTY if NO explicit output was configured
+            elif is_tty and not has_explicit_output:
+                self.verbose = True
+                self.markdown = True
+            
+            # Check if planning mode is enabled
+            if self.planning:
+                result = self._start_with_planning(prompt, **kwargs)
+            elif stream_requested:
+                # Return a generator for streaming response
+                kwargs['stream'] = True
+                result = self._start_stream(prompt, **kwargs)
+            else:
+                # Return regular chat response with animated working status
+                kwargs['stream'] = False
+                
+                # Show animated status during LLM call if verbose
+                if self.verbose and is_tty:
+                    from ..main import PRAISON_COLORS, sync_display_callbacks
+                    import threading
+                    import time as time_module
+                    
+                    console = _get_console()()
+                    start_time = time_module.time()
+                    
+                    # ─────────────────────────────────────────────────────────────
+                    # Shared state for dynamic status messages (thread-safe)
+                    # Updated by callbacks during tool execution
+                    # ─────────────────────────────────────────────────────────────
+                    current_status = ["Analyzing query..."]
+                    tools_called = []
+                    
+                    # Register a temporary callback to track tool calls
+                    def status_tool_callback(**kwargs):
+                        tool_name = kwargs.get('tool_name', '')
+                        if tool_name:
+                            tools_called.append(tool_name)
+                            current_status[0] = f"Calling tool: {tool_name}..."
+                    
+                    # Store original callback and register ours
+                    original_tool_callback = sync_display_callbacks.get('tool_call')
+                    sync_display_callbacks['tool_call'] = status_tool_callback
+                    
+                    # Animation state
+                    result_holder = [None]
+                    error_holder = [None]
+                    
+                    # Temporarily disable verbose in chat to prevent duplicate output
+                    original_verbose_chat = self.verbose
+                    
+                    def run_chat():
+                        try:
+                            # Suppress verbose during animation - we'll display result ourselves
+                            self.verbose = False
+                            current_status[0] = "Sending to LLM..."
+                            result_holder[0] = self.chat(prompt, **kwargs)
+                            current_status[0] = "Finalizing response..."
+                        except Exception as e:
+                            error_holder[0] = e
+                        finally:
+                            self.verbose = original_verbose_chat
+                            # Restore original callback
+                            if original_tool_callback:
+                                sync_display_callbacks['tool_call'] = original_tool_callback
+                            elif 'tool_call' in sync_display_callbacks:
+                                del sync_display_callbacks['tool_call']
+                    
+                    # Start chat in background thread
+                    chat_thread = threading.Thread(target=run_chat)
+                    chat_thread.start()
+                    
+                    from rich.panel import Panel
+                    from rich.text import Text
+                    from rich.markdown import Markdown
+                    
+                    # ─────────────────────────────────────────────────────────────
+                    # Smart Agent Info: Only show if user provided meaningful info
+                    # Skip if using defaults ("Agent"/"Assistant") with single agent
+                    # ─────────────────────────────────────────────────────────────
+                    has_custom_name = self.name and self.name not in ("Agent", "agent", None, "")
+                    has_custom_role = self.role and self.role not in ("Assistant", "AI Assistant", "assistant", None, "")
+                    has_tools = bool(self.tools)
+                    
+                    show_agent_info = has_custom_name or has_custom_role or has_tools
+                    
+                    agent_panel = None
+                    if show_agent_info:
+                        agent_info_parts = []
+                        if has_custom_name:
+                            agent_info_parts.append(f"[bold {PRAISON_COLORS['task']}]👤 Agent:[/] [{PRAISON_COLORS['agent_text']}]{self.name}[/]")
+                        if has_custom_role:
+                            agent_info_parts.append(f"[bold {PRAISON_COLORS['metrics']}]Role:[/] [{PRAISON_COLORS['agent_text']}]{self.role}[/]")
+                        if has_tools:
+                            tools_list = [t.__name__ if hasattr(t, '__name__') else str(t) for t in self.tools][:5]
+                            tools_str = ", ".join(f"[italic {PRAISON_COLORS['response']}]{tool}[/]" for tool in tools_list)
+                            agent_info_parts.append(f"[bold {PRAISON_COLORS['agent']}]Tools:[/] {tools_str}")
+                        
+                        agent_panel = Panel(
+                            "\n".join(agent_info_parts), 
+                            border_style=PRAISON_COLORS["agent"], 
+                            title="[bold]Agent Info[/]", 
+                            title_align="left", 
+                            padding=(1, 2)
+                        )
+                    
+                    # Create task panel
+                    task_panel = Panel.fit(
+                        Markdown(prompt) if self.markdown else Text(prompt),
+                        title="Task",
+                        border_style=PRAISON_COLORS["task"]
+                    )
+                    
+                    # Show initial panels (agent info if applicable, then task)
+                    if agent_panel:
+                        console.print(agent_panel)
+                    console.print(task_panel)
+                    
+                    # ─────────────────────────────────────────────────────────────
+                    # Animate with Rich.Status showing DYNAMIC status from callbacks
+                    # ─────────────────────────────────────────────────────────────
+                    with console.status(
+                        f"[bold yellow]Working...[/]  {current_status[0]}", 
+                        spinner="dots",
+                        spinner_style="yellow"
+                    ) as status:
+                        last_status = current_status[0]
+                        while chat_thread.is_alive():
+                            time_module.sleep(0.15)  # More responsive updates
+                            # Only update if status changed (reduces flicker)
+                            if current_status[0] != last_status:
+                                last_status = current_status[0]
+                            status.update(f"[bold yellow]Working...[/]  {current_status[0]}")
+                    
+                    # Calculate elapsed time
+                    elapsed = time_module.time() - start_time
+                    
+                    # Re-raise any error from chat
+                    if error_holder[0]:
+                        raise error_holder[0]
+                    
+                    result = result_holder[0]
+                    
+                    # Display response panel
+                    response_panel = Panel.fit(
+                        Markdown(str(result)) if self.markdown else Text(str(result)),
+                        title=f"Response ({elapsed:.1f}s)",
+                        border_style=PRAISON_COLORS["response"]
+                    )
+                    console.print(response_panel)
+                    
+                    # Show tool activity summary if tools were called (deduplicated)
+                    if tools_called:
+                        # Use dict.fromkeys to preserve order while removing duplicates
+                        unique_tools = list(dict.fromkeys(tools_called))
+                        tools_summary = ", ".join(unique_tools)
+                        console.print(f"[dim]🔧 Tools used: {tools_summary}[/dim]")
+                else:
+                    result = self.chat(prompt, **kwargs)
+            
+            # Auto-save session if enabled
+            self._auto_save_session()
+            
+            # Auto-save output to file if configured
+            if result and self._output_file:
+                self._save_output_to_file(str(result))
+            
+            return result
+        finally:
+            # Restore original output settings
+            self.verbose = original_verbose
+            self.markdown = original_markdown
+    
+    def iter_stream(self, prompt: str, **kwargs):
+        """Stream agent response as an iterator of chunks.
+        
+        App-friendly streaming. Yields response chunks without terminal display.
+        Use this for building custom UIs or processing streams programmatically.
+        
+        Args:
+            prompt: The input prompt to process
+            **kwargs: Additional arguments:
+                - display (bool): Show terminal output. Default: False
+                - output (str): Output preset override
+                
+        Yields:
+            str: Response chunks as they are generated
+            
+        Example:
+            ```python
+            agent = Agent(instructions="You are helpful")
+            
+            # Process stream programmatically
+            full_response = ""
+            for chunk in agent.iter_stream("Tell me a story"):
+                full_response += chunk
+                # Custom processing here
+            
+            # Or collect all at once
+            response = "".join(agent.iter_stream("Hello"))
+            ```
+        """
+        # Load history context
+        self._load_history_context()
+        
+        # Force streaming, no display by default (app-friendly)
+        kwargs['stream'] = True
+        
+        # Use the internal streaming generator
+        for chunk in self._start_stream(prompt, **kwargs):
+            yield chunk
         
         # Auto-save session if enabled
         self._auto_save_session()
-        
-        return result
     
     def _load_history_context(self):
         """Load history from past sessions into context.
@@ -4460,6 +5959,44 @@ Write the complete compiled report:"""
             logging.debug(f"Auto-saved session: {self.auto_save}")
         except Exception as e:
             logging.debug(f"Error auto-saving session: {e}")
+
+    def _save_output_to_file(self, content: str) -> bool:
+        """Save agent output to file if output_file is configured.
+        
+        Args:
+            content: The response content to save
+            
+        Returns:
+            True if file was saved, False otherwise
+        """
+        if not self._output_file:
+            return False
+        
+        try:
+            import os
+            
+            # Expand user home directory and resolve path
+            file_path = os.path.expanduser(self._output_file)
+            file_path = os.path.abspath(file_path)
+            
+            # Create parent directories if they don't exist
+            parent_dir = os.path.dirname(file_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+            
+            # Write content to file
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(str(content))
+            
+            # Print success message to terminal
+            print(f"✅ Output saved to {file_path}")
+            logging.debug(f"Output saved to file: {file_path}")
+            return True
+            
+        except Exception as e:
+            logging.warning(f"Failed to save output to file '{self._output_file}': {e}")
+            print(f"⚠️ Failed to save output to {self._output_file}: {e}")
+            return False
 
     def _start_stream(self, prompt: str, **kwargs) -> Generator[str, None, None]:
         """Stream generator for real-time response chunks."""
@@ -4838,7 +6375,7 @@ Write the complete compiled report:"""
             except ImportError as e:
                 # Check which specific module is missing
                 missing_module = str(e).split("No module named '")[-1].rstrip("'")
-                display_error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
+                _get_display_functions()['display_error'](f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
                 logging.error(f"Missing dependency: {missing_module}. Required for launch() method with HTTP mode.")
                 print(f"\nTo add API capabilities, install the required dependencies:")
                 print(f"pip install {missing_module}")
@@ -4900,7 +6437,7 @@ Write the complete compiled report:"""
                         if "query" not in request_data:
                             raise HTTPException(status_code=400, detail="Missing 'query' field in request")
                         query = request_data["query"]
-                    except:
+                    except Exception:
                         # Fallback to form data or query params
                         form_data = await request.form()
                         if "query" in form_data:
@@ -5004,7 +6541,7 @@ Write the complete compiled report:"""
                 from starlette.applications import Starlette
                 from starlette.requests import Request
                 from starlette.routing import Mount, Route
-                from mcp.server import Server as MCPServer # Alias to avoid conflict
+                from mcp.server import Server as MCPServer  # noqa: F401 - imported for availability check
                 import threading
                 import time
                 import inspect
@@ -5013,7 +6550,7 @@ Write the complete compiled report:"""
                 
             except ImportError as e:
                 missing_module = str(e).split("No module named '")[-1].rstrip("'")
-                display_error(f"Missing dependency: {missing_module}. Required for launch() method with MCP mode.")
+                _get_display_functions()['display_error'](f"Missing dependency: {missing_module}. Required for launch() method with MCP mode.")
                 logging.error(f"Missing dependency: {missing_module}. Required for launch() method with MCP mode.")
                 print(f"\nTo add MCP capabilities, install the required dependencies:")
                 print(f"pip install {missing_module} mcp praison-mcp starlette uvicorn") # Added mcp, praison-mcp, starlette, uvicorn
@@ -5036,8 +6573,10 @@ Write the complete compiled report:"""
                     if hasattr(self, 'achat') and asyncio.iscoroutinefunction(self.achat):
                         response = await self.achat(prompt, tools=self.tools, task_name=None, task_description=None, task_id=None)
                     elif hasattr(self, 'chat'): # Fallback for synchronous chat
+                        # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                        from ..trace.context_events import copy_context_to_callable
                         loop = asyncio.get_event_loop()
-                        response = await loop.run_in_executor(None, lambda p=prompt: self.chat(p, tools=self.tools))
+                        response = await loop.run_in_executor(None, copy_context_to_callable(lambda p=prompt: self.chat(p, tools=self.tools)))
                     else:
                         logging.error(f"Agent {self.name} has no suitable chat or achat method for MCP tool.")
                         return f"Error: Agent {self.name} misconfigured for MCP."
@@ -5129,5 +6668,5 @@ Write the complete compiled report:"""
                         print("\nMCP Server stopped")
             return None
         else:
-            display_error(f"Invalid protocol: {protocol}. Choose 'http' or 'mcp'.")
+            _get_display_functions()['display_error'](f"Invalid protocol: {protocol}. Choose 'http' or 'mcp'.")
             return None 

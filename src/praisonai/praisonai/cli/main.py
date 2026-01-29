@@ -221,7 +221,7 @@ class PraisonAI:
         # Create config_list with AutoGen compatibility
         # Support multiple environment variable patterns for better compatibility
         # Priority order: MODEL_NAME > OPENAI_MODEL_NAME for model selection
-        model_name = os.environ.get("MODEL_NAME") or os.environ.get("OPENAI_MODEL_NAME", "gpt-5-nano")
+        model_name = os.environ.get("MODEL_NAME") or os.environ.get("OPENAI_MODEL_NAME", "gpt-4o-mini")
         
         # Priority order for base_url: OPENAI_BASE_URL > OPENAI_API_BASE > OLLAMA_API_BASE
         # OPENAI_BASE_URL is the standard OpenAI SDK environment variable
@@ -686,17 +686,69 @@ class PraisonAI:
             except Exception:
                 pass  # Continue even if flow display fails
             
-            AgentsGenerator = _get_agents_generator()
-            agents_generator = AgentsGenerator(
-                self.agent_file,
-                self.framework,
-                self.config_list,
-                agent_yaml=self.agent_yaml,
-                tools=self.tools
-            )
-            result = agents_generator.generate_crew_and_kickoff()
-            print(result)
-            return result
+            # Initialize trace variables for cleanup
+            trace_writer = None
+            trace_emitter = None
+            trace_emitter_token = None
+            
+            # Get save flag for replay trace
+            save_replay = getattr(args, 'save', False)
+            
+            # Initialize replay trace writer if --save flag is set
+            import uuid
+            run_id = f"run-{uuid.uuid4().hex[:12]}"
+            if save_replay:
+                try:
+                    from praisonai.replay import ContextTraceWriter
+                    from praisonaiagents.trace.context_events import ContextTraceEmitter, set_context_emitter
+                    
+                    trace_writer = ContextTraceWriter(session_id=run_id)
+                    trace_emitter = ContextTraceEmitter(sink=trace_writer, session_id=run_id)
+                    # Set as global emitter so agents can access it
+                    trace_emitter_token = set_context_emitter(trace_emitter)
+                    trace_emitter.session_start({"agents_file": self.agent_file, "run_id": run_id})
+                    print(f"[cyan]📝 Replay trace enabled: {run_id}[/cyan]")
+                except ImportError as e:
+                    import logging
+                    logging.debug(f"Replay module not available: {e}")
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Failed to initialize trace writer: {e}")
+            
+            try:
+                AgentsGenerator = _get_agents_generator()
+                agents_generator = AgentsGenerator(
+                    self.agent_file,
+                    self.framework,
+                    self.config_list,
+                    agent_yaml=self.agent_yaml,
+                    tools=self.tools
+                )
+                result = agents_generator.generate_crew_and_kickoff()
+                print(result)
+                
+                # Close trace writer on success
+                if trace_emitter:
+                    trace_emitter.session_end()
+                    print(f"[cyan]📝 Replay trace saved: {run_id}[/cyan]")
+                if trace_writer:
+                    trace_writer.close()
+                # Reset global emitter
+                if trace_emitter_token:
+                    from praisonaiagents.trace.context_events import reset_context_emitter
+                    reset_context_emitter(trace_emitter_token)
+                
+                return result
+            except Exception as e:
+                # Cleanup trace on error
+                if trace_emitter:
+                    trace_emitter.session_end()
+                if trace_writer:
+                    trace_writer.close()
+                if trace_emitter_token:
+                    from praisonaiagents.trace.context_events import reset_context_emitter
+                    reset_context_emitter(trace_emitter_token)
+                raise
 
     def parse_args(self):
         """
@@ -742,7 +794,7 @@ class PraisonAI:
             return default_args
         
         # Define special commands
-        special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag']
+        special_commands = ['chat', 'code', 'call', 'realtime', 'train', 'ui', 'context', 'research', 'memory', 'rules', 'workflow', 'hooks', 'knowledge', 'session', 'tools', 'todo', 'docs', 'mcp', 'commit', 'serve', 'schedule', 'skills', 'profile', 'eval', 'agents', 'run', 'thinking', 'compaction', 'output', 'deploy', 'templates', 'recipe', 'endpoints', 'audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning', 'completions', 'messages', 'guardrails', 'rag', 'videos', 'a2a', 'containers', 'passthrough', 'responses', 'search', 'realtime-api', 'doctor', 'registry', 'package', 'install', 'uninstall', 'acp', 'debug', 'lsp', 'diag', 'browser', 'replay']
         
         parser = argparse.ArgumentParser(prog="praisonai", description="praisonAI command-line interface")
         parser.add_argument("--framework", choices=["crewai", "autogen", "praisonai"], help="Specify the framework")
@@ -1009,6 +1061,18 @@ class PraisonAI:
             from praisonai.cli.features.diag import run_diag_command
             exit_code = run_diag_command(unknown_args)
             sys.exit(exit_code)
+        
+        # Handle replay command - context replay for debugging agent execution
+        if args.command == 'replay':
+            from .app import app as typer_app, register_commands
+            register_commands()
+            import sys as _sys
+            _sys.argv = ['praisonai', 'replay'] + unknown_args
+            try:
+                typer_app()
+            except SystemExit as e:
+                sys.exit(e.code if e.code else 0)
+            sys.exit(0)
 
         # Handle both command and flag versions for call
         if args.command == 'call' or args.call:
@@ -1313,8 +1377,21 @@ class PraisonAI:
             
             elif args.command == 'recipe':
                 # Recipe command - new unified recipe system
+                # Re-inject flags consumed by main parser into unknown_args for recipe handler
+                recipe_args = list(unknown_args)
+                if getattr(args, 'save', False) and '--save' not in recipe_args:
+                    recipe_args.append('--save')
+                if getattr(args, 'verbose', False) and '--verbose' not in recipe_args:
+                    recipe_args.append('--verbose')
+                if getattr(args, 'profile', False) and '--profile' not in recipe_args:
+                    recipe_args.append('--profile')
+                if getattr(args, 'profile_deep', False) and '--deep-profile' not in recipe_args:
+                    recipe_args.append('--deep-profile')
+                # Re-inject memory flag for judge command (consumed by main parser)
+                if getattr(args, 'memory', False) and '--memory' not in recipe_args:
+                    recipe_args.append('--memory')
                 from .features.recipe import handle_recipe_command
-                exit_code = handle_recipe_command(unknown_args)
+                exit_code = handle_recipe_command(recipe_args)
                 sys.exit(exit_code)
             
             elif args.command == 'endpoints':
@@ -1465,7 +1542,7 @@ class PraisonAI:
                 sys.exit(0)
             
             # Capabilities CLI commands
-            elif args.command in ['audio', 'embed', 'images', 'moderate', 'files', 'batches', 
+            elif args.command in ['audio', 'embed', 'embedding', 'images', 'moderate', 'files', 'batches', 
                                   'vector-stores', 'rerank', 'ocr', 'assistants', 'fine-tuning',
                                   'completions', 'messages', 'guardrails', 'rag', 'videos',
                                   'a2a', 'containers', 'passthrough', 'responses', 'search',
@@ -1475,6 +1552,7 @@ class PraisonAI:
                 cmd_map = {
                     'audio': CapabilitiesHandler.handle_audio,
                     'embed': CapabilitiesHandler.handle_embed,
+                    'embedding': CapabilitiesHandler.handle_embed,  # Alias for embed
                     'images': CapabilitiesHandler.handle_images,
                     'moderate': CapabilitiesHandler.handle_moderate,
                     'files': CapabilitiesHandler.handle_files,
@@ -1508,6 +1586,31 @@ class PraisonAI:
                 handler = DoctorHandler()
                 exit_code = handler.run(unknown_args)
                 sys.exit(exit_code)
+            
+            elif args.command == 'browser':
+                # Browser agent command - delegate to browser CLI Typer app
+                # Uses sys.argv replacement for proper arg passthrough (matches profile command pattern)
+                from praisonai.browser.cli import app as browser_app
+                import sys as _sys
+                _sys.argv = ['praisonai', 'browser'] + unknown_args
+                try:
+                    browser_app()
+                except SystemExit as e:
+                    sys.exit(e.code if e.code else 0)
+                sys.exit(0)
+            
+            elif args.command == 'replay':
+                # Replay command - context replay for debugging agent execution
+                # Routes to Typer CLI for replay commands (list, context, show, flow, delete, cleanup)
+                from .app import app as typer_app, register_commands
+                register_commands()
+                import sys as _sys
+                _sys.argv = ['praisonai', 'replay'] + unknown_args
+                try:
+                    typer_app()
+                except SystemExit as e:
+                    sys.exit(e.code if e.code else 0)
+                sys.exit(0)
             
             elif args.command == 'registry':
                 # Registry command - manage recipe registry server
@@ -2325,11 +2428,17 @@ class PraisonAI:
             variables: Workflow variables
             args: Parsed command line arguments
         """
+        # Initialize trace variables for cleanup
+        trace_writer = None
+        trace_emitter = None
+        trace_emitter_token = None
+        
         try:
             from praisonaiagents.workflows import WorkflowManager
             from rich import print
             from rich.table import Table
             from rich.console import Console
+            import uuid
             
             console = Console()
             manager = WorkflowManager()
@@ -2350,12 +2459,60 @@ class PraisonAI:
             # Get verbose flag
             verbose = '--verbose' in action_args or '-v' in action_args or (getattr(args, 'verbose', False) if args else False)
             
+            # Get save flag for replay trace
+            save_replay = '--save' in action_args or '-s' in action_args or (getattr(args, 'save', False) if args else False)
+            
+            # Initialize replay trace writer if --save flag is set
+            run_id = f"run-{uuid.uuid4().hex[:12]}"
+            if save_replay:
+                try:
+                    from praisonai.replay import ContextTraceWriter
+                    from praisonaiagents.trace.context_events import ContextTraceEmitter, set_context_emitter
+                    from pathlib import Path
+                    
+                    trace_writer = ContextTraceWriter(session_id=run_id)
+                    trace_emitter = ContextTraceEmitter(sink=trace_writer, session_id=run_id)
+                    # Set as global emitter so agents can access it
+                    trace_emitter_token = set_context_emitter(trace_emitter)
+                    trace_emitter.session_start({"workflow": yaml_file, "run_id": run_id})
+                    print(f"[cyan]📝 Replay trace enabled: {run_id}[/cyan]")
+                except ImportError as e:
+                    import logging
+                    logging.debug(f"Replay module not available: {e}")
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Failed to initialize trace writer: {e}")
+            
             print(f"[bold cyan]Running YAML workflow: {yaml_file}[/bold cyan]")
             if parsed_vars:
                 print(f"[cyan]Variables: {parsed_vars}[/cyan]")
             
-            # Load and execute the YAML workflow
-            workflow = manager.load_yaml(yaml_file)
+            # Auto-load tools.py from recipe directory if present
+            import importlib.util
+            from pathlib import Path
+            
+            yaml_path = Path(yaml_file).resolve()
+            tools_file = yaml_path.parent / "tools.py"
+            tool_registry = {}
+            
+            if tools_file.exists():
+                try:
+                    spec = importlib.util.spec_from_file_location("recipe_tools", str(tools_file))
+                    tools_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(tools_module)
+                    
+                    # Build registry from public callable functions
+                    for name, obj in vars(tools_module).items():
+                        if callable(obj) and not name.startswith('_'):
+                            tool_registry[name] = obj
+                    
+                    if tool_registry:
+                        print(f"[cyan]Loaded {len(tool_registry)} tools from tools.py: {', '.join(tool_registry.keys())}[/cyan]")
+                except Exception as e:
+                    print(f"[yellow]Warning: Failed to load tools.py: {e}[/yellow]")
+            
+            # Load and execute the YAML workflow with tool registry
+            workflow = manager.load_yaml(yaml_file, tool_registry=tool_registry)
             
             # Show workflow info
             table = Table(title=f"Workflow: {workflow.name}")
@@ -2374,6 +2531,33 @@ class PraisonAI:
             if verbose:
                 workflow.verbose = True
             
+            # Set context management from CLI args
+            context_auto_compact = getattr(args, 'context_auto_compact', None) if args else None
+            context_strategy = getattr(args, 'context_strategy', None) if args else None
+            context_threshold = getattr(args, 'context_threshold', None) if args else None
+            
+            if context_auto_compact is True or context_strategy or context_threshold:
+                # Enable context management with CLI-specified options
+                try:
+                    from praisonaiagents.context import ManagerConfig
+                    config_kwargs = {"auto_compact": True}
+                    if context_strategy:
+                        from praisonaiagents.context import OptimizerStrategy
+                        strategy_map = {
+                            "truncate": OptimizerStrategy.TRUNCATE,
+                            "sliding_window": OptimizerStrategy.SLIDING_WINDOW,
+                            "prune_tools": OptimizerStrategy.PRUNE_TOOLS,
+                            "summarize": OptimizerStrategy.SUMMARIZE,
+                            "smart": OptimizerStrategy.SMART,
+                        }
+                        config_kwargs["strategy"] = strategy_map.get(context_strategy, OptimizerStrategy.SMART)
+                    if context_threshold:
+                        config_kwargs["compact_threshold"] = context_threshold
+                    workflow.context = ManagerConfig(**config_kwargs)
+                    print(f"[cyan]Context management enabled (strategy={context_strategy or 'smart'}, threshold={context_threshold or 0.8})[/cyan]")
+                except ImportError:
+                    print("[yellow]Warning: Context management not available[/yellow]")
+            
             # Execute
             print("\n[bold]Executing workflow...[/bold]\n")
             result = workflow.start("")
@@ -2391,10 +2575,37 @@ class PraisonAI:
                         print(output)
             else:
                 print(f"\n[red]❌ Workflow failed: {result.get('error', 'Unknown error')}[/red]")
+            
+            # Close trace writer on completion
+            if trace_emitter:
+                trace_emitter.session_end()
+                print(f"[cyan]📝 Replay trace saved: {run_id}[/cyan]")
+            if trace_writer:
+                trace_writer.close()
+            # Reset global emitter
+            if trace_emitter_token:
+                from praisonaiagents.trace.context_events import reset_context_emitter
+                reset_context_emitter(trace_emitter_token)
                 
         except FileNotFoundError:
+            # Cleanup trace on error
+            if trace_emitter:
+                trace_emitter.session_end()
+            if trace_writer:
+                trace_writer.close()
+            if trace_emitter_token:
+                from praisonaiagents.trace.context_events import reset_context_emitter
+                reset_context_emitter(trace_emitter_token)
             print(f"[red]ERROR: YAML file not found: {yaml_file}[/red]")
         except Exception as e:
+            # Cleanup trace on error
+            if trace_emitter:
+                trace_emitter.session_end()
+            if trace_writer:
+                trace_writer.close()
+            if trace_emitter_token:
+                from praisonaiagents.trace.context_events import reset_context_emitter
+                reset_context_emitter(trace_emitter_token)
             print(f"[red]ERROR: YAML workflow failed: {e}[/red]")
             import traceback
             traceback.print_exc()
@@ -2630,7 +2841,7 @@ class PraisonAI:
             print(f"[cyan]Run with: praisonai workflow run {output_file}[/cyan]")
             
         except ImportError:
-            print("[red]Auto-generation requires instructor: pip install instructor[/red]")
+            print("[red]Auto-generation requires litellm: pip install litellm[/red]")
         except Exception as e:
             print(f"[red]Generation failed: {e}[/red]")
 
@@ -2864,9 +3075,23 @@ class PraisonAI:
         Handle docs subcommand actions.
         
         Args:
-            action: The docs action (list, show, create, delete)
+            action: The docs action (list, show, create, delete, run, run-all, stats, etc.)
             action_args: Additional arguments for the action
         """
+        # Code validation commands - delegate to typer app
+        # Also handle 'cli' subcommand group for CLI validation
+        code_validation_actions = {'run', 'run-all', 'stats', 'report', 'generate', 'serve', 'cli'}
+        if action in code_validation_actions:
+            from praisonai.cli.commands.docs import app as docs_app
+            import typer
+            # Build args list for typer
+            typer_args = [action] + action_args
+            try:
+                typer.main.get_command(docs_app)(typer_args)
+            except SystemExit as e:
+                sys.exit(e.code if e.code is not None else 0)
+            return
+        
         try:
             from praisonaiagents.memory import DocsManager
             from rich import print
@@ -4690,7 +4915,7 @@ Now, {final_instruction.lower()}:"""
             
             # Use the same model configuration pattern as other CLI commands
             # Priority order: MODEL_NAME > OPENAI_MODEL_NAME for model selection
-            model_name = os.environ.get("MODEL_NAME") or os.environ.get("OPENAI_MODEL_NAME", "gpt-5-nano")
+            model_name = os.environ.get("MODEL_NAME") or os.environ.get("OPENAI_MODEL_NAME", "gpt-4o-mini")
             
             # Create ContextAgent with user's LLM configuration
             agent = ContextAgent(llm=model_name, auto_analyze=auto_analyze)

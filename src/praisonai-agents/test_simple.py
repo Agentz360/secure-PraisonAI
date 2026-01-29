@@ -19,8 +19,8 @@ def test_streaming_basic():
     agent = Agent(
         instructions="You are a helpful assistant",
         llm="mock",  # Use mock model for testing
-        self_reflect=False,
-        verbose=False,
+        reflection=False,
+        output="silent",
         stream=True
     )
     
@@ -44,8 +44,8 @@ def test_streaming_basic():
     agent_no_stream = Agent(
         instructions="You are a helpful assistant",
         llm="mock",  # Use mock model for testing
-        self_reflect=False,
-        verbose=False,
+        reflection=False,
+        output="silent",
         stream=False
     )
     

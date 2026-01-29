@@ -10,7 +10,7 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 llm_config = {
-    "model": "gpt-5-nano",  # Changed from Gemini to gpt-5-nano for better tool support
+    "model": "gpt-4o-mini",  # Changed from Gemini to gpt-5-nano for better tool support
     "temperature": 0.7,
     "response_format": {
         "type": "text"
@@ -79,7 +79,7 @@ async def run_parallel_searches():
         backstory="Expert in web search and information retrieval. You have access to the tavily_search tool to search the web.",
         tools=[tavily_search],
         llm=llm_config,
-        verbose=True
+        output="verbose"
     )
     
     # Create summary agent

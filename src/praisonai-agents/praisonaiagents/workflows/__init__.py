@@ -18,12 +18,19 @@ from .workflows import (
     Parallel,
     Loop,
     Repeat,
+    Include,
+    If,
     
     # Convenience functions
     route,
     parallel,
     loop,
     repeat,
+    include,
+    if_,
+    
+    # Constants
+    MAX_NESTING_DEPTH,
     
     # Backward compatibility aliases
     StepInput,
@@ -55,8 +62,6 @@ from .workflow_configs import (
     resolve_step_routing_config,
 )
 
-from .yaml_parser import YAMLWorkflowParser
-
 __all__ = [
     # Core
     "Workflow",
@@ -74,10 +79,17 @@ __all__ = [
     "Parallel",
     "Loop",
     "Repeat",
+    "Include",
+    "If",
     "route",
     "parallel",
     "loop",
     "repeat",
+    "include",
+    "if_",
+    
+    # Constants
+    "MAX_NESTING_DEPTH",
     
     # Workflow Config Classes
     "WorkflowOutputConfig",
@@ -109,3 +121,20 @@ __all__ = [
     "StepInput",
     "StepOutput",
 ]
+
+
+# Lazy imports for heavy modules (YAMLWorkflowParser imports Agent which triggers pydantic/rich)
+_LAZY_IMPORTS = {
+    "YAMLWorkflowParser": "yaml_parser",
+}
+
+
+def __getattr__(name: str):
+    """Lazy import mechanism for heavy modules."""
+    if name in _LAZY_IMPORTS:
+        module_name = _LAZY_IMPORTS[name]
+        import importlib
+        module = importlib.import_module(f".{module_name}", __name__)
+        return getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+

@@ -26,8 +26,8 @@ print("Testing sequential tool calling with stream=False...")
 agent = Agent(
     instructions="You are a helpful assistant. You can use the tools provided to you to help the user.",
     llm="gemini/gemini-2.5-flash-lite-preview-06-17",
-    self_reflect=False,
-    verbose=True,
+    reflection=False,
+    output="verbose",
     tools=[get_stock_price, multiply],
     stream=False  # Force non-streaming mode - use stream parameter directly
 )
@@ -40,8 +40,8 @@ print("\n\nTesting sequential tool calling with default streaming...")
 agent2 = Agent(
     instructions="You are a helpful assistant. You can use the tools provided to you to help the user.",
     llm="gemini/gemini-2.5-flash-lite-preview-06-17",
-    self_reflect=False,
-    verbose=True,
+    reflection=False,
+    output="verbose",
     tools=[get_stock_price, multiply]
 )
 

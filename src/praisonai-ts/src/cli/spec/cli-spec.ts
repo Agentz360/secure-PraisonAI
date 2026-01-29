@@ -67,7 +67,22 @@ export const COMMANDS: Record<string, Command> = {
       { name: 'parallel', type: 'boolean', default: false, description: 'Run workflow steps in parallel where possible' }
     ]
   },
+  agents: {
+    description: 'Run multi-agent orchestration',
+    args: [
+      { name: 'task', type: 'string', required: false, position: 0, description: 'Task for agents to complete' }
+    ],
+    subcommands: {
+      run: { description: 'Run multiple agents', args: [{ name: 'task', type: 'string', required: true, position: 0 }] }
+    },
+    flags: [
+      { name: 'agents', short: 'a', type: 'string', description: 'Comma-separated agent instructions' },
+      { name: 'process', short: 'p', type: 'string', enum: ['sequential', 'parallel'], default: 'sequential', description: 'Process mode' },
+      { name: 'model', short: 'm', type: 'string', description: 'Model for all agents' }
+    ]
+  },
   eval: {
+
     description: 'Evaluate agent performance',
     subcommands: {
       accuracy: {
@@ -101,7 +116,7 @@ export const COMMANDS: Record<string, Command> = {
     description: 'AI SDK provider management and testing',
     subcommands: {
       providers: { description: 'List available AI SDK providers' },
-      test: { 
+      test: {
         description: 'Test connectivity to a provider',
         args: [{ name: 'provider', type: 'string', required: false, position: 0 }]
       },
@@ -538,6 +553,27 @@ export const COMMANDS: Record<string, Command> = {
       { name: 'backend', type: 'string', description: 'Backend to test (ai-sdk, native, both)' },
       { name: 'real', type: 'boolean', description: 'Use real API calls (requires keys)' }
     ]
+  },
+  hooks: {
+    description: 'Manage hooks and callbacks',
+    subcommands: {
+      list: { description: 'List all available hook events' },
+      events: { description: 'List hook events (alias for list)' },
+      'display-types': { description: 'List display callback types' },
+      stats: { description: 'Show hooks statistics' },
+      clear: { description: 'Clear all registered callbacks' }
+    }
+  },
+  agent: {
+    description: 'Create and run a single agent',
+    args: [
+      { name: 'task', type: 'string', required: false, position: 0, description: 'Task for the agent to complete' }
+    ],
+    flags: [
+      { name: 'instructions', short: 'i', type: 'string', description: 'Agent instructions' },
+      { name: 'model', short: 'm', type: 'string', description: 'Model to use' },
+      { name: 'tools', short: 't', type: 'string', description: 'Comma-separated list of tools' }
+    ]
   }
 };
 
@@ -546,7 +582,8 @@ export const GLOBAL_FLAGS: CommandFlag[] = [
   { name: 'config', short: 'c', type: 'string', description: 'Path to config file' },
   { name: 'profile', short: 'p', type: 'string', description: 'Profile name to use' },
   { name: 'output', short: 'o', type: 'string', enum: ['json', 'text', 'pretty'], default: 'pretty', description: 'Output format' },
-  { name: 'json', type: 'boolean', default: false, description: 'Shorthand for --output json' }
+  { name: 'json', type: 'boolean', default: false, description: 'Shorthand for --output json' },
+  { name: 'db', type: 'string', description: 'Database URL for persistence (sqlite:./data.db, postgres://, redis://)' }
 ];
 
 export const EXIT_CODES = {
@@ -589,6 +626,7 @@ export const ENV_VARS = {
   PRAISONAI_PROFILE: 'PRAISONAI_PROFILE',
   PRAISONAI_VERBOSE: 'PRAISONAI_VERBOSE',
   PRAISONAI_CONFIG: 'PRAISONAI_CONFIG',
+  PRAISONAI_DB: 'PRAISONAI_DB',
   OPENAI_API_KEY: 'OPENAI_API_KEY',
   ANTHROPIC_API_KEY: 'ANTHROPIC_API_KEY',
   GOOGLE_API_KEY: 'GOOGLE_API_KEY'

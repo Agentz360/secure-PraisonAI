@@ -7,8 +7,8 @@ vision_agent = Agent(
     goal="Analyze images and videos to extract meaningful information",
     backstory="""You are an expert in computer vision and image analysis.
     You excel at describing images, detecting objects, and understanding visual content.""",
-    llm="gpt-5-nano",
-    self_reflect=False
+    llm="gpt-4o-mini",
+    reflection=False
 )
 
 # 1. Task with Image URL

@@ -10,8 +10,8 @@ def test_agent_self_reflection():
     agent = Agent(
         name="ReflectiveAgent",
         instructions="You are a helpful assistant.",
-        llm="gpt-5-nano",
-        self_reflect=True,
+        llm="gpt-4o-mini",
+        reflection=True,
         min_reflect=1,
         max_reflect=3
     )
@@ -23,15 +23,15 @@ def test_agent_self_reflection():
 def test_llm_self_reflection():
     """Test self-reflection in LLM class directly"""
     print("=== Testing LLM Self-Reflection ===")
-    llm = LLM(model="gpt-5-nano")
+    llm = LLM(model="gpt-4o-mini")
     
     response = llm.get_response(
         prompt="What is 2+2? Be brief.",
         system_prompt="You are a helpful assistant.",
-        self_reflect=True,
+        reflection=True,
         min_reflect=1,
         max_reflect=3,
-        verbose=True
+        output="verbose"
     )
     print(f"LLM Response: {response}")
     print()
@@ -39,13 +39,13 @@ def test_llm_self_reflection():
 def test_llm_no_reflection():
     """Test LLM without self-reflection for comparison"""
     print("=== Testing LLM Without Self-Reflection ===")
-    llm = LLM(model="gpt-5-nano")
+    llm = LLM(model="gpt-4o-mini")
     
     response = llm.get_response(
         prompt="What is 2+2? Be brief.",
         system_prompt="You are a helpful assistant.",
-        self_reflect=False,
-        verbose=True
+        reflection=False,
+        output="verbose"
     )
     print(f"LLM Response: {response}")
     print()

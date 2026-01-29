@@ -18,6 +18,11 @@ This module provides memory management capabilities including:
 - Docs management (like Cursor docs)
 - MCP config management (like Cursor .cursor/mcp/)
 
+Protocols:
+- MemoryProtocol: Minimal interface for memory implementations
+- AsyncMemoryProtocol: Async interface for memory
+- ResettableMemoryProtocol: Interface with reset methods
+
 Memory Providers:
 - FileMemory: Zero-dependency JSON file-based storage (default)
 - Memory: Full-featured with SQLite, ChromaDB, Mem0, MongoDB support
@@ -33,6 +38,15 @@ from .file_memory import FileMemory, create_memory
 from .rules_manager import RulesManager, Rule, create_rules_manager
 from .docs_manager import DocsManager, Doc
 from .mcp_config import MCPConfigManager, MCPConfig
+from .protocols import (
+    MemoryProtocol, 
+    AsyncMemoryProtocol, 
+    ResettableMemoryProtocol,
+    DeletableMemoryProtocol,
+    AsyncDeletableMemoryProtocol,
+    EntityMemoryProtocol,
+)
+
 
 # Lazy imports for optional modules to avoid dependency issues and improve startup time
 def __getattr__(name):
@@ -110,6 +124,31 @@ def __getattr__(name):
     if name == "create_hooks_manager":
         from .hooks import create_hooks_manager
         return create_hooks_manager
+    # Learn module
+    if name == "LearnManager":
+        from .learn import LearnManager
+        return LearnManager
+    if name == "PersonaStore":
+        from .learn import PersonaStore
+        return PersonaStore
+    if name == "InsightStore":
+        from .learn import InsightStore
+        return InsightStore
+    if name == "ThreadStore":
+        from .learn import ThreadStore
+        return ThreadStore
+    if name == "PatternStore":
+        from .learn import PatternStore
+        return PatternStore
+    if name == "DecisionStore":
+        from .learn import DecisionStore
+        return DecisionStore
+    if name == "FeedbackStore":
+        from .learn import FeedbackStore
+        return FeedbackStore
+    if name == "ImprovementStore":
+        from .learn import ImprovementStore
+        return ImprovementStore
     # DocsManager and MCPConfigManager are already imported at module level
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -153,4 +192,20 @@ __all__ = [
     # MCP config management
     "MCPConfigManager",
     "MCPConfig",
+    # Learn module
+    "LearnManager",
+    "PersonaStore",
+    "InsightStore",
+    "ThreadStore",
+    "PatternStore",
+    "DecisionStore",
+    "FeedbackStore",
+    "ImprovementStore",
+    # Protocols
+    "MemoryProtocol",
+    "AsyncMemoryProtocol",
+    "ResettableMemoryProtocol",
+    "DeletableMemoryProtocol",
+    "AsyncDeletableMemoryProtocol",
+    "EntityMemoryProtocol",
 ] 

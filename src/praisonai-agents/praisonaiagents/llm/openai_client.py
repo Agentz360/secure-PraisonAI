@@ -10,14 +10,51 @@ import logging
 import time
 import json
 import asyncio
-from typing import Any, Dict, List, Optional, Union, AsyncIterator, Iterator, Callable, Tuple
-from openai import OpenAI, AsyncOpenAI
-from openai.types.chat import ChatCompletionChunk
+from typing import Any, Dict, List, Optional, Union, AsyncIterator, Iterator, Callable, Tuple, TYPE_CHECKING
 from pydantic import BaseModel
 from dataclasses import dataclass
-from rich.console import Console
-from rich.live import Live
 import inspect
+
+# Lazy imports for optional dependencies
+_openai_module = None
+_rich_console = None
+_rich_live = None
+
+def _get_openai():
+    """Lazy import openai module."""
+    global _openai_module
+    if _openai_module is None:
+        try:
+            import openai as _openai
+            _openai_module = _openai
+        except ImportError:
+            raise ImportError(
+                "openai is required for OpenAI client. "
+                "Install with: pip install openai"
+            )
+    return _openai_module
+
+def _get_openai_classes():
+    """Get OpenAI and AsyncOpenAI classes lazily."""
+    openai = _get_openai()
+    return openai.OpenAI, openai.AsyncOpenAI
+
+def _get_rich_console():
+    """Lazy import rich Console."""
+    global _rich_console
+    if _rich_console is None:
+        from rich.console import Console
+        _rich_console = Console
+    return _rich_console
+
+def _get_rich_live():
+    """Lazy import rich Live."""
+    global _rich_live
+    if _rich_live is None:
+        from rich.live import Live
+        _rich_live = Live
+    return _rich_live
+
 
 # Import display_tool_call for callback support (lazy import to avoid circular imports)
 _display_tool_call = None
@@ -258,21 +295,23 @@ class OpenAIClient:
     def console(self):
         """Lazily initialize Rich Console only when needed."""
         if self._console is None:
-            from rich.console import Console
+            Console = _get_rich_console()
             self._console = Console()
         return self._console
     
     @property
-    def sync_client(self) -> OpenAI:
+    def sync_client(self):
         """Get the synchronous OpenAI client (lazy initialization)."""
         if self._sync_client is None:
+            OpenAI, _ = _get_openai_classes()
             self._sync_client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         return self._sync_client
     
     @property
-    def async_client(self) -> AsyncOpenAI:
+    def async_client(self):
         """Get the asynchronous OpenAI client (lazy initialization)."""
         if self._async_client is None:
+            _, AsyncOpenAI = _get_openai_classes()
             self._async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
         return self._async_client
     
@@ -303,9 +342,19 @@ class OpenAIClient:
         if system_prompt:
             # Append JSON schema if needed
             if output_json:
-                system_prompt += f"\nReturn ONLY a JSON object that matches this Pydantic model: {json.dumps(output_json.model_json_schema())}"
+                # Handle Pydantic model
+                if hasattr(output_json, 'model_json_schema'):
+                    system_prompt += f"\nReturn ONLY a JSON object that matches this Pydantic model: {json.dumps(output_json.model_json_schema())}"
+                # Handle inline dict schema (Option A from YAML)
+                elif isinstance(output_json, dict):
+                    system_prompt += f"\nReturn ONLY a JSON object that matches this schema: {json.dumps(output_json)}"
             elif output_pydantic:
-                system_prompt += f"\nReturn ONLY a JSON object that matches this Pydantic model: {json.dumps(output_pydantic.model_json_schema())}"
+                # Handle Pydantic model
+                if hasattr(output_pydantic, 'model_json_schema'):
+                    system_prompt += f"\nReturn ONLY a JSON object that matches this Pydantic model: {json.dumps(output_pydantic.model_json_schema())}"
+                # Handle inline dict schema
+                elif isinstance(output_pydantic, dict):
+                    system_prompt += f"\nReturn ONLY a JSON object that matches this schema: {json.dumps(output_pydantic)}"
             
             messages.append({"role": "system", "content": system_prompt})
         
@@ -579,7 +628,7 @@ class OpenAIClient:
         temperature: float = 1.0,
         tools: Optional[List[Dict]] = None,
         start_time: Optional[float] = None,
-        console: Optional[Console] = None,
+        console: Optional[Any] = None,
         display_fn: Optional[Callable] = None,
         reasoning_steps: bool = False,
         stream_callback: Optional[Callable] = None,
@@ -653,6 +702,7 @@ class OpenAIClient:
             
             # If display function provided, use Live display
             if display_fn:
+                Live = _get_rich_live()
                 with Live(
                     display_fn("", start_time),
                     console=console,
@@ -739,7 +789,8 @@ class OpenAIClient:
                                 content=content
                             ))
                             first_token_emitted = True
-                        else:
+                        elif _emit:
+                            # Emit DELTA_TEXT for subsequent tokens
                             stream_callback(StreamEvent(
                                 type=StreamEventType.DELTA_TEXT,
                                 timestamp=last_content_time,
@@ -787,7 +838,7 @@ class OpenAIClient:
         temperature: float = 1.0,
         tools: Optional[List[Dict]] = None,
         start_time: Optional[float] = None,
-        console: Optional[Console] = None,
+        console: Optional[Any] = None,
         display_fn: Optional[Callable] = None,
         reasoning_steps: bool = False,
         stream_callback: Optional[Callable] = None,
@@ -874,6 +925,7 @@ class OpenAIClient:
             
             # If display function provided, use Live display
             if display_fn:
+                Live = _get_rich_live()
                 with Live(
                     display_fn("", start_time),
                     console=console,
@@ -988,13 +1040,13 @@ class OpenAIClient:
     def create_completion(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         stream: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         **kwargs
-    ) -> Union[Any, Iterator[ChatCompletionChunk]]:
+    ) -> Union[Any, Iterator[Any]]:
         """
         Create a chat completion using the synchronous client.
         
@@ -1033,13 +1085,13 @@ class OpenAIClient:
     async def acreate_completion(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         stream: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
         **kwargs
-    ) -> Union[Any, AsyncIterator[ChatCompletionChunk]]:
+    ) -> Union[Any, AsyncIterator[Any]]:
         """
         Create a chat completion using the asynchronous client.
         
@@ -1078,12 +1130,12 @@ class OpenAIClient:
     def chat_completion_with_tools(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         execute_tool_fn: Optional[Callable] = None,
         stream: bool = True,
-        console: Optional[Console] = None,
+        console: Optional[Any] = None,
         display_fn: Optional[Callable] = None,
         reasoning_steps: bool = False,
         verbose: bool = True,
@@ -1125,6 +1177,10 @@ class OpenAIClient:
         iteration_count = 0
         
         while iteration_count < max_iterations:
+            # Trigger LLM callback for status/trace output
+            from ..main import execute_sync_callback
+            execute_sync_callback('llm_start', model=model, agent_name=None)
+            
             if stream:
                 # Process as streaming response with formatted tools
                 final_response = self.process_stream_response(
@@ -1145,6 +1201,7 @@ class OpenAIClient:
                     try:
                         request_start_perf = time.perf_counter()
                         ttft_logged = False
+                        Live = _get_rich_live()
                         with Live(display_fn("", start_time), console=console, refresh_per_second=10, transient=True) as live:
                             # Use streaming when display_fn is provided for progressive display
                             response_stream = self.create_completion(
@@ -1200,6 +1257,32 @@ class OpenAIClient:
             if not final_response:
                 return None
             
+            # Trigger llm_end callback with metrics for debug output
+            llm_end_time = time.perf_counter()
+            llm_latency_ms = (llm_end_time - start_time) * 1000
+            
+            # Extract usage info if available
+            usage = getattr(final_response, 'usage', None)
+            tokens_in = getattr(usage, 'prompt_tokens', 0) if usage else 0
+            tokens_out = getattr(usage, 'completion_tokens', 0) if usage else 0
+            
+            # Calculate cost using centralized module (lazy litellm import)
+            cost = None
+            try:
+                from ._cost import calculate_cost
+                cost = calculate_cost(final_response, model=model)
+            except Exception:
+                pass  # Cost calculation is optional
+            
+            execute_sync_callback(
+                'llm_end',
+                model=model,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost=cost,
+                latency_ms=llm_latency_ms
+            )
+            
             # Check for tool calls
             tool_calls = getattr(final_response.choices[0].message, 'tool_calls', None)
             
@@ -1235,17 +1318,19 @@ class OpenAIClient:
                     
                     # Always trigger callback for tool call tracking (even when verbose=False)
                     display_tool_call_fn = _get_display_tool_call()
-                    display_tool_call_fn(f"Calling function: {function_name}", console=console if verbose else None)
-                    
-                    if verbose and console:
-                        console.print(f"[dim]Arguments:[/dim] {arguments}")
                     
                     # Execute the tool
                     tool_result = execute_tool_fn(function_name, arguments)
                     results_str = json.dumps(tool_result) if tool_result else "Function returned an empty output"
                     
-                    # Trigger callback with result
-                    display_tool_call_fn(f"Function {function_name} returned: {results_str[:200]}{'...' if len(results_str) > 200 else ''}", console=console if verbose else None)
+                    # Trigger callback with structured parameters for status output
+                    display_tool_call_fn(
+                        f"Calling function: {function_name}",
+                        console=console if verbose else None,
+                        tool_name=function_name,
+                        tool_input=arguments,
+                        tool_output=results_str[:200] if results_str else None
+                    )
                     
                     messages.append({
                         "role": "tool",
@@ -1266,12 +1351,12 @@ class OpenAIClient:
     async def achat_completion_with_tools(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         execute_tool_fn: Optional[Callable] = None,
         stream: bool = True,
-        console: Optional[Console] = None,
+        console: Optional[Any] = None,
         display_fn: Optional[Callable] = None,
         reasoning_steps: bool = False,
         verbose: bool = True,
@@ -1325,6 +1410,7 @@ class OpenAIClient:
                 if display_fn and console:
                     # When verbose (display_fn provided), use streaming for better UX
                     try:
+                        Live = _get_rich_live()
                         with Live(display_fn("", start_time), console=console, refresh_per_second=4, transient=True) as live:
                             # Use streaming when display_fn is provided for progressive display
                             response_stream = await self.acreate_completion(
@@ -1450,7 +1536,7 @@ class OpenAIClient:
     def chat_completion_with_tools_stream(
         self,
         messages: List[Dict[str, Any]],
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         tools: Optional[List[Any]] = None,
         execute_tool_fn: Optional[Callable] = None,
@@ -1602,7 +1688,7 @@ class OpenAIClient:
         self,
         messages: List[Dict[str, Any]],
         response_format: BaseModel,
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         **kwargs
     ) -> Any:
@@ -1636,7 +1722,7 @@ class OpenAIClient:
         self,
         messages: List[Dict[str, Any]],
         response_format: BaseModel,
-        model: str = "gpt-5-nano",
+        model: str = "gpt-4o-mini",
         temperature: float = 1.0,
         **kwargs
     ) -> Any:

@@ -3,7 +3,7 @@ import asyncio
 import inspect
 from typing import List, Optional, Dict, Any, Type, Callable, Union, Coroutine, Literal, Tuple, get_args, get_origin
 from pydantic import BaseModel
-from ..main import TaskOutput
+from ..output.models import TaskOutput
 from ..agent.agent import Agent
 import uuid
 import os
@@ -43,6 +43,7 @@ class Task:
         rerun: bool = False, # Renamed from can_rerun and logic inverted, default True for backward compatibility
         retain_full_context: bool = False, # By default, only use previous task output, not all previous tasks
         guardrail: Optional[Union[Callable[[TaskOutput], Tuple[bool, Any]], str]] = None,
+        guardrails: Optional[Union[Callable[[TaskOutput], Tuple[bool, Any]], str]] = None,  # Alias for guardrail
         max_retries: int = 3,
         retry_count: int = 0,
         agent_config: Optional[Dict[str, Any]] = None,
@@ -86,7 +87,7 @@ class Task:
         self.quality_check = quality_check
         self.rerun = rerun # Assigning the rerun parameter
         self.retain_full_context = retain_full_context
-        self.guardrail = guardrail
+        self.guardrail = guardrail if guardrail is not None else guardrails  # guardrails is alias
         self.max_retries = max_retries
         self.retry_count = retry_count
         self._guardrail_fn = None
@@ -326,7 +327,7 @@ class Task:
                         if hasattr(self.agent.llm_instance, 'model'):
                             llm_model = self.agent.llm_instance.model
                         else:
-                            llm_model = "gpt-5-nano"  # Default fallback
+                            llm_model = "gpt-4o-mini"  # Default fallback
                     elif hasattr(self.agent, 'llm') and self.agent.llm:
                         # For standard model strings
                         llm_model = self.agent.llm

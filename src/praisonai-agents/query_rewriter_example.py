@@ -12,8 +12,7 @@ from praisonaiagents import QueryRewriterAgent, RewriteStrategy
 def main():
     # Initialize the agent
     agent = QueryRewriterAgent(
-        model="gpt-4o-mini",
-        verbose=True
+        model="gpt-4o-mini"
     )
     
     print("=" * 60)

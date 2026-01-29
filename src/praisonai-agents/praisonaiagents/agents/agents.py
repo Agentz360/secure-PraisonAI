@@ -2,15 +2,12 @@ import os
 import time
 import json
 import logging
-from typing import Any, Dict, Optional, List, Callable
-from pydantic import BaseModel
-from rich.text import Text
-from rich.panel import Panel
+from typing import Any, Dict, Optional, List
 from rich.console import Console
-from ..main import display_error, TaskOutput, error_logs
+from ..main import display_error, TaskOutput
 from ..agent.agent import Agent
 from ..task.task import Task
-from ..process.process import Process, LoopItems
+from ..process.process import Process
 import asyncio
 import uuid
 from enum import Enum
@@ -64,6 +61,52 @@ def process_video(video_path: str, seconds_per_frame=2):
         curr_frame += frames_to_skip
     video.release()
     return base64_frames
+
+
+def get_multimodal_message(text_prompt: str, images: list) -> list:
+    """
+    Build multimodal message content for LLM with text and images.
+    
+    DRY helper - replaces duplicate _get_multimodal_message in aexecute_task/execute_task.
+    
+    Args:
+        text_prompt: The text content of the message
+        images: List of image paths (local or URL)
+        
+    Returns:
+        List of content items for multimodal LLM message
+    """
+    content = [{"type": "text", "text": text_prompt}]
+    
+    for img in images:
+        # If local file path for a valid image
+        if os.path.exists(img):
+            ext = os.path.splitext(img)[1].lower()
+            # If it's a .mp4, convert to frames
+            if ext == ".mp4":
+                frames = process_video(img, seconds_per_frame=1)
+                content.append({"type": "text", "text": "These are frames from the video."})
+                for f in frames:
+                    content.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpg;base64,{f}"}
+                    })
+            else:
+                encoded = encode_file_to_base64(img)
+                content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/{ext.lstrip('.')};base64,{encoded}"
+                    }
+                })
+        else:
+            # Treat as a remote URL
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": img}
+            })
+    return content
+
 
 def process_task_context(context_item, verbose=0, user_id=None):
     """
@@ -363,7 +406,7 @@ class Agents:
         self.variables = variables if variables else {}
         
         # Check for manager_llm in environment variable if not provided
-        self.manager_llm = manager_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-5-nano')
+        self.manager_llm = manager_llm or os.getenv('OPENAI_MODEL_NAME', 'gpt-4o-mini')
         
         # Set logger level based on verbose
         if _verbose >= 5:
@@ -466,9 +509,15 @@ class Agents:
         
         if self.shared_memory:
             for task in tasks:
-                if not task.memory:
                     task.memory = self.shared_memory
                     logger.info(f"Assigned shared memory to task {task.id}")
+
+        # Telemetry
+        try:
+            from ..telemetry import get_telemetry
+            self._telemetry = get_telemetry()
+        except (ImportError, AttributeError):
+            self._telemetry = None
 
     def add_task(self, task):
         task_id = self.task_id_counter
@@ -549,9 +598,9 @@ class Agents:
         # Only import multimodal dependencies if task has images
         if task.images and task.status == "not started":
             try:
-                import cv2
-                import base64
-                from moviepy import VideoFileClip
+                import cv2  # noqa: F401 - availability check
+                import base64  # noqa: F401 - availability check
+                from moviepy import VideoFileClip  # noqa: F401 - availability check
             except ImportError as e:
                 display_error(f"Error: Missing required dependencies for image/video processing: {e}")
                 display_error("Please install with: pip install opencv-python moviepy")
@@ -566,7 +615,7 @@ class Agents:
         # Set current agent for token tracking
         llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
         if llm and hasattr(llm, 'set_current_agent'):
-            llm.set_current_agent(executor_agent.name)
+            llm.set_current_agent(executor_agent.display_name)
 
         # Ensure tools are available from both task and agent
         tools = task.tools or []
@@ -599,44 +648,13 @@ Context:
         task_prompt += "Please provide only the final result of your work. Do not add any conversation or extra explanation."
 
         if self.verbose >= 2:
-            logger.info(f"Executing task {task_id}: {task.description} using {executor_agent.name}")
+            logger.info(f"Executing task {task_id}: {task.description} using {executor_agent.display_name}")
         logger.debug(f"Starting execution of task {task_id} with prompt:\n{task_prompt}")
 
         if task.images:
-            def _get_multimodal_message(text_prompt, images):
-                content = [{"type": "text", "text": text_prompt}]
-
-                for img in images:
-                    # If local file path for a valid image
-                    if os.path.exists(img):
-                        ext = os.path.splitext(img)[1].lower()
-                        # If it's a .mp4, convert to frames
-                        if ext == ".mp4":
-                            frames = process_video(img, seconds_per_frame=1)
-                            content.append({"type": "text", "text": "These are frames from the video."})
-                            for f in frames:
-                                content.append({
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpg;base64,{f}"}
-                                })
-                        else:
-                            encoded = encode_file_to_base64(img)
-                            content.append({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/{ext.lstrip('.')};base64,{encoded}"
-                                }
-                            })
-                    else:
-                        # Treat as a remote URL
-                        content.append({
-                            "type": "image_url",
-                            "image_url": {"url": img}
-                        })
-                return content
-
+            # Use shared multimodal helper (DRY - defined at module level)
             agent_output = await executor_agent.achat(
-                _get_multimodal_message(task_prompt, task.images),
+                get_multimodal_message(task_prompt, task.images),
                 tools=tools,
                 output_json=task.output_json,
                 output_pydantic=task.output_pydantic,
@@ -660,7 +678,7 @@ Context:
                 description=task.description,
                 summary=task.description[:10],
                 raw=agent_output,
-                agent=executor_agent.name,
+                agent=executor_agent.display_name,
                 output_format="RAW"
             )
             
@@ -676,7 +694,7 @@ Context:
                     parsed = json.loads(cleaned)
                     task_output.json_dict = parsed
                     task_output.output_format = "JSON"
-                except:
+                except Exception:
                     logger.warning(f"Warning: Could not parse output of task {task_id} as JSON")
                     logger.debug(f"Output that failed JSON parsing: {agent_output}")
 
@@ -687,7 +705,7 @@ Context:
                     pyd_obj = task.output_pydantic(**parsed)
                     task_output.pydantic = pyd_obj
                     task_output.output_format = "Pydantic"
-                except:
+                except Exception:
                     logger.warning(f"Warning: Could not parse output of task {task_id} as Pydantic Model")
                     logger.debug(f"Output that failed Pydantic parsing: {agent_output}")
 
@@ -780,8 +798,10 @@ Context:
                         tasks_to_run = []
                     
                     # Run sync task in an executor to avoid blocking the event loop
+                    # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                    from ..trace.context_events import copy_context_to_callable
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, self.run_task, task_id)
+                    await loop.run_in_executor(None, copy_context_to_callable(lambda tid=task_id: self.run_task(tid)))
 
             if tasks_to_run:
                 await asyncio.gather(*tasks_to_run)
@@ -804,8 +824,10 @@ Context:
                     # Before running a sync task, execute all pending async tasks
                     await flush_async_tasks()
                     # Run sync task in an executor to avoid blocking the event loop
+                    # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                    from ..trace.context_events import copy_context_to_callable
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, self.run_task, task_id)
+                    await loop.run_in_executor(None, copy_context_to_callable(lambda tid=task_id: self.run_task(tid)))
             
             # Execute any remaining async tasks at the end
             await flush_async_tasks()
@@ -817,17 +839,23 @@ Context:
                     await self.arun_task(task_id)
                 else:
                     # Run sync task in an executor to avoid blocking the event loop
+                    # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                    from ..trace.context_events import copy_context_to_callable
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, self.run_task, task_id)
+                    await loop.run_in_executor(None, copy_context_to_callable(lambda tid=task_id: self.run_task(tid)))
 
     async def astart(self, content=None, return_dict=False, **kwargs):
-        """Async version of start method
+        """Async version of start method.
         
         Args:
             content: Optional content to add to all tasks' context
             return_dict: If True, returns the full results dictionary instead of only the final response
             **kwargs: Additional arguments
         """
+        # Track execution via telemetry
+        if hasattr(self, '_telemetry') and self._telemetry:
+            self._telemetry.track_agent_execution(self.name, success=True, async_mode=True)
+            
         if content:
             # Add content to context of all tasks
             for task in self.tasks.values():
@@ -888,9 +916,9 @@ Context:
         # Only import multimodal dependencies if task has images
         if task.images and task.status == "not started":
             try:
-                import cv2
-                import base64
-                from moviepy import VideoFileClip
+                import cv2  # noqa: F401 - availability check
+                import base64  # noqa: F401 - availability check
+                from moviepy import VideoFileClip  # noqa: F401 - availability check
             except ImportError as e:
                 display_error(f"Error: Missing required dependencies for image/video processing: {e}")
                 display_error("Please install with: pip install opencv-python moviepy")
@@ -910,7 +938,7 @@ Context:
         # Set current agent for token tracking
         llm = getattr(executor_agent, 'llm', None) or getattr(executor_agent, 'llm_instance', None)
         if llm and hasattr(llm, 'set_current_agent'):
-            llm.set_current_agent(executor_agent.name)
+            llm.set_current_agent(executor_agent.display_name)
 
         # Substitute variables in task description if provided
         task_description = task.description
@@ -957,44 +985,13 @@ Context:
         task_prompt += "Please provide only the final result of your work. Do not add any conversation or extra explanation."
 
         if self.verbose >= 2:
-            logger.info(f"Executing task {task_id}: {task.description} using {executor_agent.name}")
+            logger.info(f"Executing task {task_id}: {task.description} using {executor_agent.display_name}")
         logger.debug(f"Starting execution of task {task_id} with prompt:\n{task_prompt}")
 
         if task.images:
-            def _get_multimodal_message(text_prompt, images):
-                content = [{"type": "text", "text": text_prompt}]
-
-                for img in images:
-                    # If local file path for a valid image
-                    if os.path.exists(img):
-                        ext = os.path.splitext(img)[1].lower()
-                        # If it's a .mp4, convert to frames
-                        if ext == ".mp4":
-                            frames = process_video(img, seconds_per_frame=1)
-                            content.append({"type": "text", "text": "These are frames from the video."})
-                            for f in frames:
-                                content.append({
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/jpg;base64,{f}"}
-                                })
-                        else:
-                            encoded = encode_file_to_base64(img)
-                            content.append({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/{ext.lstrip('.')};base64,{encoded}"
-                                }
-                            })
-                    else:
-                        # Treat as a remote URL
-                        content.append({
-                            "type": "image_url",
-                            "image_url": {"url": img}
-                        })
-                return content
-
+            # Use shared multimodal helper (DRY - defined at module level)
             agent_output = executor_agent.chat(
-                _get_multimodal_message(task_prompt, task.images),
+                get_multimodal_message(task_prompt, task.images),
                 tools=task.tools,
                 output_json=task.output_json,
                 output_pydantic=task.output_pydantic,
@@ -1020,7 +1017,7 @@ Context:
                 try:
                     task.store_in_memory(
                         content=agent_output,
-                        agent_name=executor_agent.name,
+                        agent_name=executor_agent.display_name,
                         task_id=task_id
                     )
                 except Exception as e:
@@ -1030,7 +1027,7 @@ Context:
                 description=task.description,
                 summary=task.description[:10],
                 raw=agent_output,
-                agent=executor_agent.name,
+                agent=executor_agent.display_name,
                 output_format="RAW"
             )
             
@@ -1046,7 +1043,7 @@ Context:
                     parsed = json.loads(cleaned)
                     task_output.json_dict = parsed
                     task_output.output_format = "JSON"
-                except:
+                except Exception:
                     logger.warning(f"Warning: Could not parse output of task {task_id} as JSON")
                     logger.debug(f"Output that failed JSON parsing: {agent_output}")
 
@@ -1057,7 +1054,7 @@ Context:
                     pyd_obj = task.output_pydantic(**parsed)
                     task_output.pydantic = pyd_obj
                     task_output.output_format = "Pydantic"
-                except:
+                except Exception:
                     logger.warning(f"Warning: Could not parse output of task {task_id} as Pydantic Model")
                     logger.debug(f"Output that failed Pydantic parsing: {agent_output}")
 
@@ -1193,30 +1190,146 @@ Context:
             return str(agent[0])
         return None
 
-    def start(self, content=None, return_dict=False, **kwargs):
-        """Start agent execution with optional content and config
+    def start(self, content=None, return_dict=False, output=None, **kwargs):
+        """Start agent execution with verbose output (beginner-friendly).
+        
+        Shows Rich panels with workflow progress when in TTY. Use .run() for
+        silent execution in production/scripts.
         
         Args:
             content: Optional content to add to all tasks' context
-            return_dict: If True, returns the full results dictionary instead of only the final response
+            return_dict: If True, returns the full results dictionary
+            output: Output preset - "silent", "verbose", "normal", etc.
+                    Default in TTY: "verbose" (shows progress)
+                    Default non-TTY: "silent"
             **kwargs: Additional arguments
+            
+        Example:
+            ```python
+            # Interactive - shows Rich panels
+            agents = Agents(agents=[agent1, agent2])
+            result = agents.start()  # Verbose output by default
+            
+            # Force silent mode
+            result = agents.start(output="silent")
+            ```
         """
+        # Track execution via telemetry
+        if hasattr(self, '_telemetry') and self._telemetry:
+            self._telemetry.track_agent_execution(self.name, success=True)
+        import sys
+        from ..main import PRAISON_COLORS
+        
+        # Determine if we're in an interactive TTY
+        is_tty = sys.stdout.isatty()
+        
+        # Resolve output mode (TTY-aware)
+        if output is None:
+            # Default: verbose in TTY (beginner-friendly), silent otherwise
+            # Note: Don't check self.verbose here - start() is for interactive use
+            show_verbose = is_tty
+        elif output == "silent":
+            show_verbose = False
+        elif output in ("verbose", "debug", "normal"):
+            show_verbose = True
+        else:
+            show_verbose = is_tty
+        
+        # Add content to context if provided
         if content:
-            # Add content to context of all tasks
             for task in self.tasks.values():
                 if isinstance(content, (str, list)):
-                    # If context is empty, initialize it
                     if not task.context:
                         task.context = []
-                    # Add content to context
                     task.context.append(content)
         
-        # Planning Mode: Create plan and todo list before execution
-        if self.planning:
-            self._run_with_planning()
+        # ─────────────────────────────────────────────────────────────
+        # Verbose Mode: Show Rich panels for multi-agent workflow
+        # ─────────────────────────────────────────────────────────────
+        if show_verbose and is_tty:
+            from rich.panel import Panel
+            console = Console()
+            import time as time_module
+            
+            # Show workflow overview panel
+            agent_names = " → ".join([a.display_name for a in self.agents])
+            workflow_info = f"[bold {PRAISON_COLORS['metrics']}]Process:[/] {self.process}\n"
+            workflow_info += f"[bold {PRAISON_COLORS['metrics']}]Agents:[/] {agent_names}"
+            
+            console.print(Panel(
+                workflow_info,
+                title="[bold]Multi-Agent Workflow[/]",
+                border_style=PRAISON_COLORS["agent"],
+                padding=(1, 2)
+            ))
+            console.print()
+            
+            # Execute tasks with verbose output
+            total_agents = len(self.agents)
+            workflow_start_time = time_module.time()
+            
+            for idx, (task_id, task) in enumerate(self.tasks.items(), 1):
+                agent = task.agent
+                agent_name = agent.display_name if agent else "Unknown"
+                agent_model = getattr(agent, 'llm', 'gpt-4o-mini') if agent else "unknown"
+                
+                # Show agent task panel with model info
+                task_desc = task.description[:100] + "..." if len(task.description) > 100 else task.description
+                panel_content = f"[bold {PRAISON_COLORS['task_text']}]📋 Task:[/] {task_desc}\n"
+                panel_content += f"[dim]🤖 Model: {agent_model}[/dim]"
+                console.print(Panel.fit(
+                    panel_content,
+                    title=f"[bold]Agent [{idx}/{total_agents}]: {agent_name}[/]",
+                    border_style=PRAISON_COLORS["task"]
+                ))
+                
+                # Execute with timing and status
+                start_time = time_module.time()
+                
+                # Show working spinner
+                with console.status(
+                    f"[bold yellow]Working...[/]  {agent_name} generating response...",
+                    spinner="dots",
+                    spinner_style="yellow"
+                ):
+                    # Run the task
+                    if self.planning:
+                        self._run_with_planning()
+                        break  # Planning mode handles all tasks
+                    else:
+                        self.run_task(task_id)
+                
+                elapsed = time_module.time() - start_time
+                
+                # Show response panel - FULL response, no truncation
+                result = self.get_task_result(task_id)
+                if result:
+                    response_text = str(result.raw)
+                    # No truncation - show full response in verbose mode
+                    from rich.markdown import Markdown
+                    console.print(Panel(
+                        Markdown(response_text),
+                        title=f"[bold]Agent [{idx}/{total_agents}] Complete ({elapsed:.1f}s)[/]",
+                        border_style=PRAISON_COLORS["response"],
+                        padding=(1, 2)
+                    ))
+                console.print()
+            
+            # Workflow summary panel
+            total_elapsed = time_module.time() - workflow_start_time
+            console.print(Panel.fit(
+                f"[bold green]Total Time:[/] {total_elapsed:.1f}s\n"
+                f"[bold green]Agents Run:[/] {total_agents}/{total_agents}",
+                title="[bold]✅ Workflow Complete[/]",
+                border_style="green"
+            ))
+            console.print()
         else:
-            # Run tasks as before
-            self.run_all_tasks()
+            # Silent mode: Run tasks without display
+            if self.planning:
+                self._run_with_planning()
+            else:
+                self.run_all_tasks()
         
         # Auto-display token metrics if any agent has metrics=True
         metrics_enabled = any(getattr(agent, 'metrics', False) for agent in self.agents)
@@ -1224,10 +1337,8 @@ Context:
             try:
                 self.display_token_usage()
             except (ImportError, AttributeError) as e:
-                # Token tracking not available or not properly configured
                 logging.debug(f"Could not auto-display token usage: {e}")
             except Exception as e:
-                # Log unexpected errors for debugging
                 logging.debug(f"Unexpected error in token metrics display: {e}")
         
         # Get results
@@ -1238,7 +1349,6 @@ Context:
         
         # By default, return only the final agent's response
         if not return_dict:
-            # Get the last task (assuming sequential processing)
             task_ids = list(self.tasks.keys())
             if task_ids:
                 last_task_id = task_ids[-1]
@@ -1246,12 +1356,21 @@ Context:
                 if last_result:
                     return last_result.raw
                     
-        # Return full results dict if return_dict is True or if no final result was found
         return results
 
     def run(self, content=None, return_dict=False, **kwargs):
-        """Alias for start() method to provide consistent API with Agent class"""
-        return self.start(content=content, return_dict=return_dict, **kwargs)
+        """Run agents silently (production use).
+        
+        Unlike .start() which shows verbose output, .run() executes silently
+        for programmatic/production use.
+        
+        Args:
+            content: Optional content to add to all tasks' context
+            return_dict: If True, returns the full results dictionary
+            **kwargs: Additional arguments
+        """
+        # Always run silently - no verbose output
+        return self.start(content=content, return_dict=return_dict, output="silent", **kwargs)
 
     def set_state(self, key: str, value: Any) -> None:
         """Set a state value"""
@@ -1331,7 +1450,7 @@ Context:
                 "user_id": self.user_id,
                 "run_id": self.run_id,
                 "state": self._state,
-                "agents": [agent.name for agent in self.agents],
+                "agents": [agent.display_name for agent in self.agents],
                 "process": self.process
             }
             self.shared_memory.store_short_term(
@@ -1543,7 +1662,7 @@ Context:
                         if "query" not in request_data:
                             raise HTTPException(status_code=400, detail="Missing 'query' field in request")
                         query = request_data["query"]
-                    except:
+                    except Exception:
                         # Fallback to form data or query params
                         form_data = await request.form()
                         if "query" in form_data:
@@ -1565,22 +1684,24 @@ Context:
                                 response = await agent_instance.achat(current_input, task_name=None, task_description=None, task_id=None)
                             else:
                                 # Run sync function in a thread to avoid blocking
+                                # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                                from ..trace.context_events import copy_context_to_callable
                                 loop = asyncio.get_running_loop()
                                 # Correctly pass current_input to the lambda for closure
-                                response = await loop.run_in_executor(None, lambda ci=current_input: agent_instance.chat(ci))
+                                response = await loop.run_in_executor(None, copy_context_to_callable(lambda ci=current_input: agent_instance.chat(ci)))
                             
                             # Store this agent's result
                             results.append({
-                                "agent": agent_instance.name,
+                                "agent": agent_instance.display_name,
                                 "response": response
                             })
                             
                             # Use this response as input to the next agent
                             current_input = response
                         except Exception as e:
-                            logging.error(f"Error with agent {agent_instance.name}: {str(e)}", exc_info=True)
+                            logging.error(f"Error with agent {agent_instance.display_name}: {str(e)}", exc_info=True)
                             results.append({
-                                "agent": agent_instance.name,
+                                "agent": agent_instance.display_name,
                                 "error": str(e)
                             })
                             # Decide error handling: continue with original input, last good input, or stop? 
@@ -1603,19 +1724,19 @@ Context:
                     )
             
             print(f"🚀 Multi-Agent HTTP API available at http://{host}:{port}{path}")
-            agent_names = ", ".join([agent.name for agent in self.agents])
+            agent_names = ", ".join([agent.display_name for agent in self.agents])
             print(f"📊 Available agents for this endpoint ({len(self.agents)}): {agent_names}")
             
             # Create per-agent endpoints for individual agent access
             # This allows n8n and other tools to call specific agents
-            agents_dict = {agent.name.lower().replace(' ', '_'): agent for agent in self.agents}
+            agents_dict = {agent.display_name.lower().replace(' ', '_'): agent for agent in self.agents}
             
             # Add GET endpoint to list available agents
             @_agents_shared_apps[port].get(f"{path}/list")
             async def list_agents():
                 return {
                     "agents": [
-                        {"name": agent.name, "id": agent.name.lower().replace(' ', '_')}
+                        {"name": agent.display_name, "id": agent.display_name.lower().replace(' ', '_')}
                         for agent in self.agents
                     ]
                 }
@@ -1632,23 +1753,25 @@ Context:
                             query = request_data.get("query", "")
                             if not query:
                                 raise HTTPException(status_code=400, detail="Missing 'query' field")
-                        except:
+                        except Exception:
                             raise HTTPException(status_code=400, detail="Invalid JSON body")
                         
                         try:
                             if asyncio.iscoroutinefunction(agent.chat):
                                 response = await agent.achat(query)
                             else:
+                                # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                                from ..trace.context_events import copy_context_to_callable
                                 loop = asyncio.get_running_loop()
-                                response = await loop.run_in_executor(None, lambda q=query: agent.chat(q))
+                                response = await loop.run_in_executor(None, copy_context_to_callable(lambda q=query: agent.chat(q)))
                             
                             return {
-                                "agent": agent.name,
+                                "agent": agent.display_name,
                                 "query": query,
                                 "response": response
                             }
                         except Exception as e:
-                            logging.error(f"Error with agent {agent.name}: {str(e)}", exc_info=True)
+                            logging.error(f"Error with agent {agent.display_name}: {str(e)}", exc_info=True)
                             return JSONResponse(
                                 status_code=500,
                                 content={"error": f"Agent error: {str(e)}"}
@@ -1771,23 +1894,25 @@ Context:
 
                 for agent_instance in self.agents:
                     try:
-                        logging.debug(f"Processing with agent: {agent_instance.name}")
+                        logging.debug(f"Processing with agent: {agent_instance.display_name}")
                         if hasattr(agent_instance, 'achat') and asyncio.iscoroutinefunction(agent_instance.achat):
                             response = await agent_instance.achat(current_input, tools=agent_instance.tools, task_name=None, task_description=None, task_id=None)
                         elif hasattr(agent_instance, 'chat'): # Fallback to sync chat if achat not suitable
+                            # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+                            from ..trace.context_events import copy_context_to_callable
                             loop = asyncio.get_running_loop()
-                            response = await loop.run_in_executor(None, lambda ci=current_input: agent_instance.chat(ci, tools=agent_instance.tools))
+                            response = await loop.run_in_executor(None, copy_context_to_callable(lambda ci=current_input: agent_instance.chat(ci, tools=agent_instance.tools)))
                         else:
-                            logging.warning(f"Agent {agent_instance.name} has no suitable chat or achat method.")
-                            response = f"Error: Agent {agent_instance.name} has no callable chat method."
+                            logging.warning(f"Agent {agent_instance.display_name} has no suitable chat or achat method.")
+                            response = f"Error: Agent {agent_instance.display_name} has no callable chat method."
                         
                         current_input = response if response is not None else "Agent returned no response."
                         final_response = current_input # Keep track of the last valid response
-                        logging.debug(f"Agent {agent_instance.name} responded. Current intermediate output: {current_input}")
+                        logging.debug(f"Agent {agent_instance.display_name} responded. Current intermediate output: {current_input}")
 
                     except Exception as e:
-                        logging.error(f"Error during agent {agent_instance.name} execution in MCP workflow: {str(e)}", exc_info=True)
-                        current_input = f"Error from agent {agent_instance.name}: {str(e)}"
+                        logging.error(f"Error during agent {agent_instance.display_name} execution in MCP workflow: {str(e)}", exc_info=True)
+                        current_input = f"Error from agent {agent_instance.display_name}: {str(e)}"
                         final_response = current_input # Update final response to show error
                         # Optionally break or continue based on desired error handling for the workflow
                         # For now, we continue, and the error is passed to the next agent or returned.
@@ -1826,7 +1951,7 @@ Context:
             # Instead of trying to extract tool names, hardcode the known tool name
             mcp_tool_names = [actual_mcp_tool_name]  # Use the determined dynamic tool name
             print(f"🛠️ Available MCP tools: {', '.join(mcp_tool_names)}")
-            agent_names_in_workflow = ", ".join([a.name for a in self.agents])
+            agent_names_in_workflow = ", ".join([a.display_name for a in self.agents])
             print(f"🔄 Agents in MCP workflow: {agent_names_in_workflow}")
 
             def run_praison_mcp_server():
@@ -2136,7 +2261,7 @@ Context:
         console.print("\n[bold blue]🚀 EXECUTION PHASE[/bold blue]\n")
         
         # Map agent names to agent instances
-        agent_map = {agent.name: agent for agent in self.agents}
+        agent_map = {agent.display_name: agent for agent in self.agents}
         
         # Store original tasks and create new tasks from plan
         original_tasks = self.tasks.copy()
@@ -2176,7 +2301,7 @@ Context:
             # Find matching original task for additional config (memory, callbacks, etc.)
             original_task = None
             for orig_task in original_tasks.values():
-                if orig_task.agent and orig_task.agent.name == agent.name:
+                if orig_task.agent and orig_task.agent.display_name == agent.display_name:
                     original_task = orig_task
                     break
             
@@ -2191,7 +2316,7 @@ Context:
                 # Inherit from original task if available
                 memory=original_task.memory if original_task else None,
                 callback=original_task.callback if original_task else None,
-                guardrail=original_task.guardrail if original_task else None,
+                guardrails=original_task.guardrail if original_task else None,
                 max_retries=original_task.max_retries if original_task else 3,
                 output_json=original_task.output_json if original_task else None,
                 output_pydantic=original_task.output_pydantic if original_task else None,
@@ -2217,7 +2342,7 @@ Context:
                 console.print(f"[dim]Progress: [{bar}] {progress * 100:.0f}%[/dim]")
                 
                 console.print(f"\n[bold]📌 Step {i + 1}/{len(self.tasks)}:[/bold] {task.description[:60]}...")
-                console.print(f"[dim]   Agent: {task.agent.name if task.agent else 'Unknown'}[/dim]")
+                console.print(f"[dim]   Agent: {task.agent.display_name if task.agent else 'Unknown'}[/dim]")
                 
                 # Mark as in progress
                 self._todo_list.start(item.id)

@@ -19,7 +19,10 @@ __all__ = [
     'DeployType',
     'CloudProvider',
     'recipe',
+    'embed',
+    'embedding',
 ]
+
 
 # Lazy loading for heavy imports
 def __getattr__(name):
@@ -42,6 +45,23 @@ def __getattr__(name):
     elif name == 'recipe':
         from .recipe import core as recipe_module
         return recipe_module
+    elif name == 'embed':
+        # Re-export from core SDK for unified API
+        from praisonaiagents.embedding.embed import embed
+        return embed
+    elif name == 'embedding':
+        # Re-export from core SDK for unified API
+        from praisonaiagents.embedding.embed import embedding
+        return embedding
+    elif name == 'aembed':
+        from praisonaiagents.embedding.embed import aembed
+        return aembed
+    elif name == 'aembedding':
+        from praisonaiagents.embedding.embed import aembedding
+        return aembedding
+    elif name == 'EmbeddingResult':
+        from praisonaiagents.embedding import EmbeddingResult
+        return EmbeddingResult
     
     # Try praisonaiagents exports
     try:
@@ -52,3 +72,6 @@ def __getattr__(name):
         pass
     
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+

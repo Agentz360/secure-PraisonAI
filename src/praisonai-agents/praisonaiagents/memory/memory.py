@@ -23,39 +23,102 @@ def trace(self, message, *args, **kwargs):
 
 logging.Logger.trace = trace
 
-try:
-    import chromadb
-    from chromadb.config import Settings as ChromaSettings
-    CHROMADB_AVAILABLE = True
-except ImportError:
-    CHROMADB_AVAILABLE = False
-    pass
+# Lazy availability flags and cached imports
+_chromadb_cache = {"available": None, "module": None, "settings": None}
+_mem0_cache = {"available": None, "module": None}
+_openai_cache = {"available": None, "module": None}
+_litellm_cache = {"available": None, "module": None}
+_pymongo_cache = {"available": None, "module": None, "client": None}
 
-try:
-    import mem0
-    MEM0_AVAILABLE = True
-except ImportError:
-    MEM0_AVAILABLE = False
+def _check_chromadb():
+    """Lazily check chromadb availability and cache."""
+    if _chromadb_cache["available"] is None:
+        try:
+            import chromadb
+            from chromadb.config import Settings as ChromaSettings
+            _chromadb_cache["available"] = True
+            _chromadb_cache["module"] = chromadb
+            _chromadb_cache["settings"] = ChromaSettings
+        except ImportError:
+            _chromadb_cache["available"] = False
+    return _chromadb_cache["available"]
 
-try:
-    import openai
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
+def _get_chromadb():
+    """Get chromadb module (lazy load)."""
+    if not _check_chromadb():
+        raise ImportError("chromadb is required. Install with: pip install chromadb")
+    return _chromadb_cache["module"], _chromadb_cache["settings"]
 
-try:
-    import litellm
-    litellm.telemetry = False  # Disable telemetry
-    LITELLM_AVAILABLE = True
-except ImportError:
-    LITELLM_AVAILABLE = False
+def _check_mem0():
+    """Lazily check mem0 availability."""
+    if _mem0_cache["available"] is None:
+        try:
+            import mem0
+            _mem0_cache["available"] = True
+            _mem0_cache["module"] = mem0
+        except ImportError:
+            _mem0_cache["available"] = False
+    return _mem0_cache["available"]
 
-try:
-    import pymongo
-    from pymongo import MongoClient
-    PYMONGO_AVAILABLE = True
-except ImportError:
-    PYMONGO_AVAILABLE = False
+def _get_mem0():
+    """Get mem0 module (lazy load)."""
+    if not _check_mem0():
+        raise ImportError("mem0 is required. Install with: pip install mem0ai")
+    return _mem0_cache["module"]
+
+def _check_openai():
+    """Lazily check openai availability."""
+    if _openai_cache["available"] is None:
+        try:
+            import openai
+            _openai_cache["available"] = True
+            _openai_cache["module"] = openai
+        except ImportError:
+            _openai_cache["available"] = False
+    return _openai_cache["available"]
+
+def _get_openai():
+    """Get openai module (lazy load)."""
+    if not _check_openai():
+        raise ImportError("openai is required. Install with: pip install openai")
+    return _openai_cache["module"]
+
+def _check_litellm():
+    """Lazily check litellm availability."""
+    if _litellm_cache["available"] is None:
+        try:
+            import litellm
+            litellm.telemetry = False
+            _litellm_cache["available"] = True
+            _litellm_cache["module"] = litellm
+        except ImportError:
+            _litellm_cache["available"] = False
+    return _litellm_cache["available"]
+
+def _get_litellm():
+    """Get litellm module (lazy load)."""
+    if not _check_litellm():
+        raise ImportError("litellm is required. Install with: pip install litellm")
+    return _litellm_cache["module"]
+
+def _check_pymongo():
+    """Lazily check pymongo availability."""
+    if _pymongo_cache["available"] is None:
+        try:
+            import pymongo
+            from pymongo import MongoClient
+            _pymongo_cache["available"] = True
+            _pymongo_cache["module"] = pymongo
+            _pymongo_cache["client"] = MongoClient
+        except ImportError:
+            _pymongo_cache["available"] = False
+    return _pymongo_cache["available"]
+
+def _get_pymongo():
+    """Get pymongo module and MongoClient (lazy load)."""
+    if not _check_pymongo():
+        raise ImportError("pymongo is required. Install with: pip install pymongo")
+    return _pymongo_cache["module"], _pymongo_cache["client"]
 
 
 
@@ -109,7 +172,7 @@ class Memory:
         },
         "llm": {
           "provider": "openai",
-          "config": {"model": "gpt-5-nano", "api_key": "..."}
+          "config": {"model": "gpt-4o-mini", "api_key": "..."}
         },
         "embedder": {
           "provider": "openai",
@@ -142,10 +205,12 @@ class Memory:
         logging.getLogger('litellm.utils').setLevel(logging.WARNING)
             
         self.provider = self.cfg.get("provider", "rag")
-        self.use_mem0 = (self.provider.lower() == "mem0") and MEM0_AVAILABLE
-        self.use_rag = (self.provider.lower() == "rag") and CHROMADB_AVAILABLE and self.cfg.get("use_embedding", False)
-        self.use_mongodb = (self.provider.lower() == "mongodb") and PYMONGO_AVAILABLE
+        self.use_mem0 = (self.provider.lower() == "mem0") and _check_mem0()
+        self.use_rag = (self.provider.lower() == "rag") and _check_chromadb() and self.cfg.get("use_embedding", False)
+        self.use_mongodb = (self.provider.lower() == "mongodb") and _check_pymongo()
         self.graph_enabled = False  # Initialize graph support flag
+        self._learn_manager = None  # Lazy-loaded LearnManager
+        self._learn_config = self.cfg.get("learn", None)  # Learn configuration
         
         # Extract embedding model from config
         self.embedder_config = self.cfg.get("embedder", {})
@@ -184,6 +249,24 @@ class Memory:
         """Only log if verbose >= 5"""
         if self.verbose >= 5:
             logger.log(level, msg)
+
+    def _emit_memory_event(self, event_type: str, memory_type: str, 
+                           content_length: int = 0, query: str = "", 
+                           result_count: int = 0, top_score: float = None,
+                           metadata: Dict[str, Any] = None):
+        """Emit memory trace event if tracing is enabled (zero overhead when disabled)."""
+        try:
+            from ..trace.context_events import get_context_emitter
+            emitter = get_context_emitter()
+            if not emitter.enabled:
+                return
+            agent_name = self.cfg.get("agent_name", "unknown")
+            if event_type == "store":
+                emitter.memory_store(agent_name, memory_type, content_length, metadata)
+            elif event_type == "search":
+                emitter.memory_search(agent_name, query, result_count, memory_type, top_score)
+        except Exception:
+            pass  # Silent fail - tracing should never break memory operations
 
     # -------------------------------------------------------------------------
     #                          Initialization
@@ -271,6 +354,9 @@ class Memory:
             # Create directory if it doesn't exist
             rag_path = self.cfg.get("rag_db_path", "chroma_db")
             os.makedirs(rag_path, exist_ok=True)
+
+            # Get chromadb lazily
+            chromadb, ChromaSettings = _get_chromadb()
 
             # Initialize ChromaDB with persistent storage
             self.chroma_client = chromadb.PersistentClient(
@@ -395,52 +481,19 @@ class Memory:
             self._log_verbose(f"Error creating vector search indexes: {e}", logging.WARNING)
 
     def _get_embedding(self, text: str) -> List[float]:
-        """Get embedding for text using available embedding services."""
+        """Get embedding for text using the unified embedding module."""
         try:
-            if LITELLM_AVAILABLE:
-                # Use LiteLLM for consistency with the rest of the codebase
-                import litellm
-                
-                response = litellm.embedding(
-                    model=self.embedding_model,
-                    input=text
-                )
-                return response.data[0]["embedding"]
-            elif OPENAI_AVAILABLE:
-                # Fallback to OpenAI client
-                from openai import OpenAI
-                client = OpenAI()
-                
-                response = client.embeddings.create(
-                    input=text,
-                    model=self.embedding_model
-                )
-                return response.data[0].embedding
-            else:
-                self._log_verbose("Neither litellm nor openai available for embeddings", logging.WARNING)
-                return None
+            from praisonaiagents.embedding import embedding
+            result = embedding(text, model=self.embedding_model)
+            return result.embeddings[0] if result.embeddings else None
         except Exception as e:
             self._log_verbose(f"Error getting embedding: {e}", logging.ERROR)
             return None
 
     def _get_embedding_dimensions(self, model_name: str) -> int:
         """Get embedding dimensions based on model name."""
-        # Common embedding model dimensions
-        model_dimensions = {
-            "text-embedding-3-small": 1536,
-            "text-embedding-3-large": 3072,
-            "text-embedding-ada-002": 1536,
-            "text-embedding-002": 1536,
-            # Add more models as needed
-        }
-        
-        # Check if model name contains known model identifiers
-        for model_key, dimensions in model_dimensions.items():
-            if model_key in model_name.lower():
-                return dimensions
-        
-        # Default to 1536 for unknown models (OpenAI standard)
-        return 1536
+        from praisonaiagents.embedding import get_dimensions
+        return get_dimensions(model_name)
 
     # -------------------------------------------------------------------------
     #                      Basic Quality Score Computation
@@ -538,6 +591,9 @@ class Memory:
             logger.error(f"Failed to store in SQLite short-term memory: {e}")
             if not self.use_mongodb:  # Only raise if we're not using MongoDB as fallback
                 raise
+        
+        # Emit trace event for memory store
+        self._emit_memory_event("store", "short_term", len(text), metadata=metadata)
 
     def search_short_term(
         self, 
@@ -622,27 +678,12 @@ class Memory:
             
         elif self.use_rag and hasattr(self, "chroma_col"):
             try:
-                if LITELLM_AVAILABLE:
-                    # Use LiteLLM for consistency with the rest of the codebase
-                    import litellm
-                    
-                    response = litellm.embedding(
-                        model=self.embedding_model,
-                        input=query
-                    )
-                    query_embedding = response.data[0]["embedding"]
-                elif OPENAI_AVAILABLE:
-                    # Fallback to OpenAI client
-                    from openai import OpenAI
-                    client = OpenAI()
-                    
-                    response = client.embeddings.create(
-                        input=query,
-                        model=self.embedding_model
-                    )
-                    query_embedding = response.data[0].embedding
-                else:
-                    self._log_verbose("Neither litellm nor openai available for embeddings", logging.WARNING)
+                from praisonaiagents.embedding import embedding
+                result = embedding(query, model=self.embedding_model)
+                query_embedding = result.embeddings[0] if result.embeddings else None
+                
+                if query_embedding is None:
+                    self._log_verbose("Failed to get embedding for query", logging.WARNING)
                     return []
                 
                 resp = self.chroma_col.query(
@@ -688,6 +729,10 @@ class Memory:
                         "text": row[1],
                         "metadata": meta
                     })
+            # Emit trace event for memory search
+            top_score = results[0].get("score") if results else None
+            self._emit_memory_event("search", "short_term", query=query, 
+                                   result_count=len(results), top_score=top_score)
             return results
 
     def reset_short_term(self):
@@ -785,39 +830,20 @@ class Memory:
         # Store in vector database if enabled
         if self.use_rag and hasattr(self, "chroma_col"):
             try:
-                if LITELLM_AVAILABLE:
-                    # Use LiteLLM for consistency with the rest of the codebase
-                    import litellm
-                    
-                    logger.info("Getting embeddings from LiteLLM...")
-                    logger.trace(f"Embedding input text: {text}")
-                    
-                    response = litellm.embedding(
-                        model=self.embedding_model,
-                        input=text
-                    )
-                    embedding = response.data[0]["embedding"]
-                    logger.info("Successfully got embeddings from LiteLLM")
-                    logger.trace(f"Received embedding of length: {len(embedding)}")
-                    
-                elif OPENAI_AVAILABLE:
-                    # Fallback to OpenAI client
-                    from openai import OpenAI
-                    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-                    
-                    logger.info("Getting embeddings from OpenAI...")
-                    logger.trace(f"Embedding input text: {text}")
-                    
-                    response = client.embeddings.create(
-                        input=text,
-                        model=self.embedding_model
-                    )
-                    embedding = response.data[0].embedding
-                    logger.info("Successfully got embeddings from OpenAI")
-                    logger.trace(f"Received embedding of length: {len(embedding)}")
-                else:
-                    logger.warning("Neither litellm nor openai available for embeddings")
+                from praisonaiagents.embedding import embedding as get_embedding
+                
+                logger.info("Getting embeddings...")
+                logger.trace(f"Embedding input text: {text}")
+                
+                result = get_embedding(text, model=self.embedding_model)
+                embedding = result.embeddings[0] if result.embeddings else None
+                
+                if embedding is None:
+                    logger.warning("Failed to get embedding")
                     return
+                    
+                logger.info("Successfully got embeddings")
+                logger.trace(f"Received embedding of length: {len(embedding)}")
                 
                 # Sanitize metadata for ChromaDB
                 sanitized_metadata = self._sanitize_metadata(metadata)
@@ -839,7 +865,9 @@ class Memory:
                 logger.info("Successfully stored in Mem0")
             except Exception as e:
                 logger.error(f"Error storing in Mem0: {e}")
-
+        
+        # Emit trace event for memory store
+        self._emit_memory_event("store", "long_term", len(text), metadata=metadata)
 
     def search_long_term(
         self, 
@@ -938,27 +966,12 @@ class Memory:
 
         elif self.use_rag and hasattr(self, "chroma_col"):
             try:
-                if LITELLM_AVAILABLE:
-                    # Use LiteLLM for consistency with the rest of the codebase
-                    import litellm
-                    
-                    response = litellm.embedding(
-                        model=self.embedding_model,
-                        input=query
-                    )
-                    query_embedding = response.data[0]["embedding"]
-                elif OPENAI_AVAILABLE:
-                    # Fallback to OpenAI client
-                    from openai import OpenAI
-                    client = OpenAI()
-                    
-                    response = client.embeddings.create(
-                        input=query,
-                        model=self.embedding_model
-                    )
-                    query_embedding = response.data[0].embedding
-                else:
-                    self._log_verbose("Neither litellm nor openai available for embeddings", logging.WARNING)
+                from praisonaiagents.embedding import embedding as get_embedding
+                result = get_embedding(query, model=self.embedding_model)
+                query_embedding = result.embeddings[0] if result.embeddings else None
+                
+                if query_embedding is None:
+                    self._log_verbose("Failed to get embedding for query", logging.WARNING)
                     return []
                 
                 # Search ChromaDB with embedding
@@ -1027,7 +1040,12 @@ class Memory:
             results = [r for r in results if r.get("score", 1.0) >= relevance_cutoff]
             logger.info(f"After relevance filter: {len(results)} results")
         
-        return results[:limit]
+        final_results = results[:limit]
+        # Emit trace event for memory search
+        top_score = final_results[0].get("score") if final_results else None
+        self._emit_memory_event("search", "long_term", query=query, 
+                               result_count=len(final_results), top_score=top_score)
+        return final_results
 
     def reset_long_term(self):
         """Clear local LTM DB, plus Chroma, MongoDB, or mem0 if in use."""
@@ -1048,6 +1066,213 @@ class Memory:
         if self.use_rag and hasattr(self, "chroma_client"):
             self.chroma_client.reset()  # entire DB
             self._init_chroma()         # re-init fresh
+
+    # -------------------------------------------------------------------------
+    #                       Selective Deletion Methods
+    # -------------------------------------------------------------------------
+    
+    def delete_short_term(self, memory_id: str) -> bool:
+        """
+        Delete a specific short-term memory by ID.
+        
+        Args:
+            memory_id: The unique ID of the memory to delete
+            
+        Returns:
+            True if memory was found and deleted, False otherwise
+        """
+        deleted = False
+        
+        # Delete from SQLite
+        try:
+            conn = sqlite3.connect(self.short_db)
+            cursor = conn.execute(
+                "DELETE FROM short_mem WHERE id = ?", (memory_id,)
+            )
+            if cursor.rowcount > 0:
+                deleted = True
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            self._log_verbose(f"Error deleting from SQLite short-term: {e}", logging.ERROR)
+        
+        # Delete from MongoDB if enabled
+        if self.use_mongodb and hasattr(self, "mongo_short_term"):
+            try:
+                result = self.mongo_short_term.delete_one({"_id": memory_id})
+                if result.deleted_count > 0:
+                    deleted = True
+            except Exception as e:
+                self._log_verbose(f"Error deleting from MongoDB short-term: {e}", logging.ERROR)
+        
+        if deleted:
+            self._log_verbose(f"Deleted short-term memory: {memory_id}")
+        
+        return deleted
+    
+    def delete_long_term(self, memory_id: str) -> bool:
+        """
+        Delete a specific long-term memory by ID.
+        
+        Works across all backends: SQLite, ChromaDB, Mem0, and MongoDB.
+        
+        Args:
+            memory_id: The unique ID of the memory to delete
+            
+        Returns:
+            True if memory was found and deleted, False otherwise
+        """
+        deleted = False
+        
+        # Delete from SQLite
+        try:
+            conn = sqlite3.connect(self.long_db)
+            cursor = conn.execute(
+                "DELETE FROM long_mem WHERE id = ?", (memory_id,)
+            )
+            if cursor.rowcount > 0:
+                deleted = True
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            self._log_verbose(f"Error deleting from SQLite long-term: {e}", logging.ERROR)
+        
+        # Delete from ChromaDB if enabled
+        if self.use_rag and hasattr(self, "chroma_col"):
+            try:
+                # ChromaDB delete by ID
+                self.chroma_col.delete(ids=[memory_id])
+                deleted = True  # ChromaDB doesn't raise on non-existent ID
+            except Exception as e:
+                self._log_verbose(f"Error deleting from ChromaDB: {e}", logging.ERROR)
+        
+        # Delete from Mem0 if enabled
+        if self.use_mem0 and hasattr(self, "mem0_client"):
+            try:
+                # Mem0 has a delete method
+                self.mem0_client.delete(memory_id)
+                deleted = True
+            except Exception as e:
+                self._log_verbose(f"Error deleting from Mem0: {e}", logging.ERROR)
+        
+        # Delete from MongoDB if enabled
+        if self.use_mongodb and hasattr(self, "mongo_long_term"):
+            try:
+                result = self.mongo_long_term.delete_one({"_id": memory_id})
+                if result.deleted_count > 0:
+                    deleted = True
+            except Exception as e:
+                self._log_verbose(f"Error deleting from MongoDB long-term: {e}", logging.ERROR)
+        
+        if deleted:
+            self._log_verbose(f"Deleted long-term memory: {memory_id}")
+        
+        return deleted
+    
+    def delete_memory(
+        self, 
+        memory_id: str, 
+        memory_type: Optional[str] = None
+    ) -> bool:
+        """
+        Delete a specific memory by ID.
+        
+        This is the unified deletion method that searches across all memory types
+        and all backends (SQLite, ChromaDB, Mem0, MongoDB).
+        
+        Particularly useful for:
+        - Cleaning up image-based memories after processing to free context window
+        - Removing outdated or incorrect information
+        - Privacy compliance (selective erasure)
+        
+        Args:
+            memory_id: The unique ID of the memory to delete
+            memory_type: Optional type hint to narrow search:
+                        'short_term', 'long_term'
+                        If None, searches all types.
+            
+        Returns:
+            True if memory was found and deleted, False otherwise
+        
+        Example:
+            # Delete a specific image analysis memory
+            memory.delete_memory("1705123456789")
+            
+            # Delete with type hint for faster lookup
+            memory.delete_memory("1705123456789", memory_type="short_term")
+        """
+        # If type specified, only search that type
+        if memory_type == "short_term":
+            return self.delete_short_term(memory_id)
+        elif memory_type == "long_term":
+            return self.delete_long_term(memory_id)
+        
+        # Search both types
+        if self.delete_short_term(memory_id):
+            return True
+        if self.delete_long_term(memory_id):
+            return True
+        
+        return False
+    
+    def delete_memories(self, memory_ids: List[str]) -> int:
+        """
+        Delete multiple memories by their IDs.
+        
+        Args:
+            memory_ids: List of memory IDs to delete
+            
+        Returns:
+            Number of memories successfully deleted
+        """
+        count = 0
+        for memory_id in memory_ids:
+            if self.delete_memory(memory_id):
+                count += 1
+        return count
+    
+    def delete_memories_matching(
+        self, 
+        query: str, 
+        memory_type: Optional[str] = None,
+        limit: int = 10
+    ) -> int:
+        """
+        Delete memories matching a search query.
+        
+        Useful for bulk cleanup of related memories, e.g., all image-related
+        context after finishing an image analysis session.
+        
+        Args:
+            query: Search query to match memories
+            memory_type: Optional type ('short_term' or 'long_term')
+            limit: Maximum number of memories to delete
+            
+        Returns:
+            Number of memories deleted
+        """
+        deleted = 0
+        
+        # Search short-term if applicable
+        if memory_type in (None, "short_term"):
+            results = self.search_short_term(query, limit=limit)
+            for result in results:
+                memory_id = result.get("id")
+                if memory_id and self.delete_short_term(memory_id):
+                    deleted += 1
+        
+        # Search long-term if applicable
+        if memory_type in (None, "long_term"):
+            results = self.search_long_term(query, limit=limit)
+            for result in results:
+                memory_id = result.get("id")
+                if memory_id and self.delete_long_term(memory_id):
+                    deleted += 1
+        
+        if deleted:
+            self._log_verbose(f"Deleted {deleted} memories matching '{query}'")
+        
+        return deleted
 
     # -------------------------------------------------------------------------
     #                       Entity Memory Methods
@@ -1437,12 +1662,12 @@ class Memory:
         """
 
         try:
-            if LITELLM_AVAILABLE:
+            if _check_litellm():
                 # Use LiteLLM for consistency with the rest of the codebase
                 import litellm
                 
                 # Convert model name if it's in litellm format
-                model_name = llm or "gpt-5-nano"
+                model_name = llm or "gpt-4o-mini"
                 
                 response = litellm.completion(
                     model=model_name,
@@ -1453,13 +1678,13 @@ class Memory:
                     response_format={"type": "json_object"},
                     temperature=0.3
                 )
-            elif OPENAI_AVAILABLE:
+            elif _check_openai():
                 # Fallback to OpenAI client
                 from openai import OpenAI
                 client = OpenAI()
                 
                 response = client.chat.completions.create(
-                    model=llm or "gpt-5-nano",
+                    model=llm or "gpt-4o-mini",
                     messages=[{
                         "role": "user", 
                         "content": custom_prompt or default_prompt
@@ -1599,3 +1824,50 @@ class Memory:
         except Exception as e:
             self._log_verbose(f"Error getting all memories: {e}", logging.ERROR)
             return []
+
+    # -------------------------------------------------------------------------
+    #                          Learn Integration
+    # -------------------------------------------------------------------------
+    @property
+    def learn(self):
+        """
+        Get the LearnManager for continuous learning capabilities.
+        
+        Returns None if learn is not enabled in config.
+        
+        Usage:
+            memory = Memory({"learn": True})
+            memory.learn.capture_persona("User prefers concise responses")
+            memory.learn.capture_insight("User works in data science")
+        """
+        if self._learn_manager is not None:
+            return self._learn_manager
+        
+        if self._learn_config is None or self._learn_config is False:
+            return None
+        
+        from .learn import LearnManager
+        from ..config.feature_configs import LearnConfig
+        
+        if self._learn_config is True:
+            config = LearnConfig()
+        elif isinstance(self._learn_config, dict):
+            config = LearnConfig(**self._learn_config)
+        elif isinstance(self._learn_config, LearnConfig):
+            config = self._learn_config
+        else:
+            return None
+        
+        user_id = self.cfg.get("user_id", "default")
+        self._learn_manager = LearnManager(config=config, user_id=user_id)
+        return self._learn_manager
+    
+    def get_learn_context(self) -> str:
+        """
+        Get learning context suitable for injection into system prompt.
+        
+        Returns empty string if learn is not enabled.
+        """
+        if self.learn is None:
+            return ""
+        return self.learn.to_system_prompt_context()

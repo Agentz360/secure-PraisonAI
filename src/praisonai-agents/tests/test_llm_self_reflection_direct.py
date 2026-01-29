@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Test LLM class directly to verify self-reflection fix"""
 
+import os
+import pytest
 from praisonaiagents.llm import LLM
 
 # Define calculator tool locally to avoid import issues
@@ -20,20 +22,26 @@ def calculator(expression: str) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-def test_llm_direct():
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get("OPENAI_API_KEY"),
+    reason="OPENAI_API_KEY not set - skipping integration test"
+)
+@pytest.mark.asyncio
+async def test_llm_direct():
     """Test LLM class directly with self-reflection and tools"""
     print("=== Testing LLM Direct with Self-Reflection and Tools ===")
     
     # Create LLM instance
-    llm = LLM(model="gpt-5-nano")
+    llm = LLM(model="gpt-4o-mini")
     
     # Test with self-reflection and tools
     try:
-        response = llm.get_response(
+        response = await llm.get_response_async(
             prompt="Calculate 15 * 23 and verify your answer",
             system_prompt="You are a helpful math assistant. Use tools when needed.",
             tools=[calculator],
-            self_reflect=True,
+            reflection=True,
             min_reflect=1,
             max_reflect=2,
             verbose=True

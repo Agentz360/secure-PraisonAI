@@ -55,11 +55,9 @@ def main():
         retrieve information from a comprehensive MongoDB knowledge base. You excel 
         at finding relevant information, synthesizing knowledge from multiple sources, 
         and providing accurate, context-aware responses.""",
-        knowledge_config=mongodb_knowledge_config,
         knowledge=[os.path.join(os.path.dirname(__file__), "llms.md")],
         memory=True,
-        verbose=True,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create a research assistant agent
@@ -72,8 +70,7 @@ def main():
         knowledge base. You ensure information is accurate, well-structured, 
         and properly categorized.""",
         memory=True,
-        verbose=True,
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create tasks for knowledge management
@@ -128,7 +125,7 @@ def main():
         agents=[research_agent, knowledge_agent],
         tasks=knowledge_tasks,
         memory=True,
-        verbose=True
+        output="verbose"
     )
     
     # Execute the knowledge management pipeline

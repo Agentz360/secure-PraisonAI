@@ -29,7 +29,7 @@ def test_gemini_embedding():
         role="Memory Tester",
         goal="Test memory storage with embeddings",
         backstory="An agent that tests memory functionality",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     # Create a task
@@ -43,7 +43,7 @@ def test_gemini_embedding():
     agents_openai = Agents(
         agents=[agent],
         tasks=[task],
-        verbose=5,
+        output="debug",
         memory=True
     )
     
@@ -60,7 +60,7 @@ def test_gemini_embedding():
         role="Memory Tester",
         goal="Test memory storage with explicit OpenAI embeddings",
         backstory="An agent that tests memory functionality",
-        llm="gpt-5-nano"
+        llm="gpt-4o-mini"
     )
     
     task2 = Task(
@@ -72,7 +72,7 @@ def test_gemini_embedding():
     agents_openai_explicit = Agents(
         agents=[agent2],
         tasks=[task2],
-        verbose=5,
+        output="debug",
         memory=True,
         embedder={
             "provider": "openai",
@@ -95,7 +95,7 @@ def test_gemini_embedding():
         role="Memory Tester with Gemini",
         goal="Test memory storage with Gemini embeddings",
         backstory="An agent that tests Gemini embedding functionality",
-        llm="gpt-5-nano"  # Still use GPT for chat, but Gemini for embeddings
+        llm="gpt-4o-mini"  # Still use GPT for chat, but Gemini for embeddings
     )
     
     task3 = Task(
@@ -108,7 +108,7 @@ def test_gemini_embedding():
     agents_gemini = Agents(
         agents=[agent3],
         tasks=[task3],
-        verbose=5,
+        output="debug",
         memory=True,
         embedder={
             "provider": "gemini",

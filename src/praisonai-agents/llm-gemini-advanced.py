@@ -2,7 +2,7 @@ from praisonaiagents import Agent
 
 # Detailed LLM configuration
 llm_config = {
-    "model": "gemini/gemini-1.5-flash-latest",  # Model name without provider prefix
+    "model": "gemini/gemini-3-flash-preview",  # Model name without provider prefix
     
     # Core settings
     "temperature": 0.7,                # Controls randomness (like temperature)
@@ -25,18 +25,15 @@ llm_config = {
     
     # Additional controls
     "seed": 42,                      # For reproducible responses
-    "stop_phrases": ["##", "END"],   # Custom stop sequences
+    "stop_phrases": ["---END---", "END"],   # Custom stop sequences
 }
 
 agent = Agent(
     instructions="You are a helpful Assistant specialized in scientific explanations. "
                 "Provide clear, accurate, and engaging responses.",
     llm=llm_config,                  # Pass the detailed configuration
-    verbose=True,                    # Enable detailed output
-    markdown=True,                   # Format responses in markdown
-    self_reflect=True,              # Enable self-reflection
-    max_reflect=3,                  # Maximum reflection iterations
-    min_reflect=1                   # Minimum reflection iterations
+    output="verbose",                # Enable detailed output (includes markdown)
+    reflection=True                  # Enable self-reflection with defaults
 )
 
 # Test the agent

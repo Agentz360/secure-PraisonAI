@@ -110,22 +110,8 @@ class MongoDBMemory:
     
     def _get_embedding_dimensions(self, model_name: str) -> int:
         """Get embedding dimensions based on model name."""
-        # Common embedding model dimensions
-        model_dimensions = {
-            "text-embedding-3-small": 1536,
-            "text-embedding-3-large": 3072,
-            "text-embedding-ada-002": 1536,
-            "text-embedding-002": 1536,
-            # Add more models as needed
-        }
-        
-        # Check if model name contains known model identifiers
-        for model_key, dimensions in model_dimensions.items():
-            if model_key in model_name.lower():
-                return dimensions
-        
-        # Default to 1536 for unknown models (OpenAI standard)
-        return 1536
+        from praisonaiagents.embedding import get_dimensions
+        return get_dimensions(model_name)
     
     def _create_indexes(self):
         """Create necessary indexes for MongoDB."""
@@ -173,16 +159,11 @@ class MongoDBMemory:
             logging.warning(f"Could not create vector search index: {e}")
     
     def _get_embedding(self, text):
-        """Get embedding for text using litellm for unified provider support."""
+        """Get embedding for text using the unified embedding module."""
         try:
-            import litellm
-            
-            # Use litellm.embedding() for unified multi-provider support
-            response = litellm.embedding(
-                model=self.embedding_model_name,
-                input=text
-            )
-            return response.data[0]["embedding"]
+            from praisonaiagents.embedding import embedding
+            result = embedding(text, model=self.embedding_model_name)
+            return result.embeddings[0] if result.embeddings else None
         except Exception as e:
             logging.error(f"Error getting embedding: {e}")
             return None
@@ -577,6 +558,35 @@ class Knowledge:
         if self._verbose and self._verbose >= level:
             logger.info(message)
 
+    def _emit_knowledge_event(self, event_type: str, query: str = "", results=None, 
+                              agent_id: str = None, source: str = "", chunk_count: int = 0,
+                              metadata: dict = None):
+        """Emit knowledge trace event if tracing is enabled (zero overhead when disabled)."""
+        try:
+            from ..trace.context_events import get_context_emitter
+            emitter = get_context_emitter()
+            if not emitter.enabled:
+                return
+            agent_name = agent_id or "unknown"
+            if event_type == "search":
+                result_list = results if isinstance(results, list) else []
+                sources = []
+                top_score = None
+                for r in result_list[:10]:
+                    if isinstance(r, dict):
+                        meta = r.get("metadata", {})
+                        if meta and isinstance(meta, dict):
+                            src = meta.get("source") or meta.get("filename", "")
+                            if src:
+                                sources.append(src)
+                        if top_score is None:
+                            top_score = r.get("score")
+                emitter.knowledge_search(agent_name, query, len(result_list), sources, top_score)
+            elif event_type == "add":
+                emitter.knowledge_add(agent_name, source, chunk_count, metadata)
+        except Exception:
+            pass  # Silent fail - tracing should never break knowledge operations
+
     def store(self, content, user_id=None, agent_id=None, run_id=None, metadata=None):
         """Store a memory."""
         try:
@@ -637,7 +647,12 @@ class Knowledge:
         if rerank is None:
             rerank = self.config.get("reranker", {}).get("default_rerank", False)
         
-        return self.memory.search(query, user_id=user_id, agent_id=agent_id, run_id=run_id, rerank=rerank, **kwargs)
+        results = self.memory.search(query, user_id=user_id, agent_id=agent_id, run_id=run_id, rerank=rerank, **kwargs)
+        
+        # Emit trace event for knowledge search
+        self._emit_knowledge_event("search", query, results, agent_id)
+        
+        return results
 
     def update(self, memory_id, data):
         """Update a memory."""
@@ -799,6 +814,10 @@ class Knowledge:
                                 logging.warning(f"Unexpected memory_result type: {type(memory_result)}, skipping")
                         progress.advance(store_task)
 
+            # Emit trace event for knowledge add
+            self._emit_knowledge_event("add", source=input_path, chunk_count=len(memories), 
+                                       metadata=metadata, agent_id=agent_id)
+            
             return {'results': all_results, 'relations': []}
 
         except Exception as e:

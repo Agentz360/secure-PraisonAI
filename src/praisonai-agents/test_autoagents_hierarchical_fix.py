@@ -47,8 +47,8 @@ def test_hierarchical_without_openai():
             tools=[get_stock_price],
             process="hierarchical",
             llm="gemini/gemini-2.5-flash-lite-preview-06-17",
-            self_reflect=True,
-            verbose=True,
+            reflection=True,
+            output="verbose",
             max_agents=3  # Maximum number of agents to create
         )
         
@@ -88,7 +88,7 @@ def test_hierarchical_with_mock_llm():
                 "api_key": "mock-key",
                 "base_url": "http://localhost:9999"  # Non-existent URL
             },
-            verbose=False,
+            output="silent",
             max_agents=2
         )
         

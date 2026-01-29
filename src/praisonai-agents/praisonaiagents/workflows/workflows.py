@@ -21,18 +21,120 @@ Storage Structure:
 
 import os
 import re
+import json
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable, Tuple, Union
 from dataclasses import dataclass, field
 
 from .workflow_configs import (
-    WorkflowOutputConfig, WorkflowPlanningConfig, WorkflowMemoryConfig, WorkflowHooksConfig,
+    WorkflowPlanningConfig, WorkflowMemoryConfig,
     WorkflowStepContextConfig, WorkflowStepOutputConfig, WorkflowStepExecutionConfig, WorkflowStepRoutingConfig,
-    WorkflowOutputPreset, WorkflowStepExecutionPreset
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_json_output(output: Any, step_name: str = "step") -> Any:
+    """
+    Parse JSON from LLM output if it's a string.
+    
+    Handles:
+    - Direct JSON strings: '{"key": "value"}'
+    - Markdown code blocks: ```json\n{"key": "value"}\n```
+    - LLM echoing schema: {'type': 'array', 'items': [...]} -> extract items
+    
+    Returns:
+        Parsed dict/list if successful, original output otherwise
+    """
+    if not isinstance(output, str) or not output:
+        # Handle LLM echoing schema structure even for non-string outputs
+        if isinstance(output, dict):
+            return _extract_from_schema_echo(output)
+        return output
+    
+    # Try direct JSON parse first
+    try:
+        parsed = json.loads(output)
+        # Check if LLM echoed the schema structure
+        if isinstance(parsed, dict):
+            parsed = _extract_from_schema_echo(parsed)
+        return parsed
+    except json.JSONDecodeError:
+        pass
+    
+    # Try extracting from markdown code block
+    json_match = re.search(r'```(?:json)?\s*\n?([\s\S]*?)\n?```', output)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(1).strip())
+            if isinstance(parsed, dict):
+                parsed = _extract_from_schema_echo(parsed)
+            return parsed
+        except json.JSONDecodeError:
+            pass
+    
+    # Try finding JSON object/array in text
+    # Look for {...} or [...]
+    for pattern in [r'(\{[^}]+\})', r'(\[[^\]]+\])']:
+        match = re.search(pattern, output)
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, dict):
+                    parsed = _extract_from_schema_echo(parsed)
+                return parsed
+            except json.JSONDecodeError:
+                continue
+    
+    # Return original if can't parse
+    logger.debug(f"Could not parse JSON from step '{step_name}' output")
+    return output
+
+
+def _extract_from_schema_echo(data: dict) -> Any:
+    """
+    Extract actual data when LLM echoes the JSON schema structure.
+    
+    Common patterns:
+    - {'type': 'array', 'items': [...]} -> return [...]
+    - {'type': 'object', 'properties': {...}, 'data': {...}} -> return data
+    - {'items': [...]} -> return [...] (native structured output wrapper)
+    - {'keywords': [...]} -> return as-is (normal output)
+    
+    Args:
+        data: Dict that might contain echoed schema
+        
+    Returns:
+        Extracted data or original dict
+    """
+    # Check if this looks like a schema echo with 'type' and actual data
+    if 'type' in data:
+        data_type = data.get('type')
+        
+        # Array schema echo: {'type': 'array', 'items': [...]}
+        if data_type == 'array' and 'items' in data:
+            items = data['items']
+            # If items is a list, that's our actual data
+            if isinstance(items, list):
+                logger.debug("Extracted items from schema-echoed array output")
+                return items
+        
+        # Object schema echo: {'type': 'object', 'properties': {...}, 'data': {...}}
+        if data_type == 'object':
+            # Check for actual data field
+            if 'data' in data and isinstance(data['data'], dict):
+                logger.debug("Extracted data from schema-echoed object output")
+                return data['data']
+    
+    # Handle native structured output wrapper: {'items': [...]}
+    # This is created by _build_response_format when wrapping arrays
+    if 'items' in data and len(data) == 1 and isinstance(data['items'], list):
+        logger.debug("Extracted items from native structured output array wrapper")
+        return data['items']
+    
+    # Not a schema echo, return as-is
+    return data
 
 
 @dataclass
@@ -102,10 +204,10 @@ class Parallel:
 @dataclass
 class Loop:
     """
-    Iterate over a list or CSV file, executing step for each item.
+    Iterate over a list or CSV file, executing step(s) for each item.
     
     Usage:
-        # Loop over list variable
+        # Loop over list variable (sequential) - single step
         workflow = Workflow(
             steps=[loop(processor, over="items")],
             variables={"items": ["a", "b", "c"]}
@@ -115,26 +217,71 @@ class Loop:
         workflow = Workflow(steps=[
             loop(processor, from_csv="data.csv")
         ])
+        
+        # Parallel loop over items (concurrent execution)
+        workflow = Workflow(
+            steps=[loop(processor, over="items", parallel=True)],
+            variables={"items": ["a", "b", "c"]}
+        )
+        
+        # Parallel with limited workers
+        workflow = Workflow(
+            steps=[loop(processor, over="items", parallel=True, max_workers=4)],
+            variables={"items": ["a", "b", "c"]}
+        )
+        
+        # Multi-step loop (NEW) - execute multiple steps per iteration
+        workflow = Workflow(
+            steps=[loop(
+                steps=[researcher, writer, publisher],  # Multiple steps
+                over="topics",
+                parallel=True,
+                max_workers=4
+            )],
+            variables={"topics": [...]}
+        )
     """
-    step: Any = None
+    step: Any = None  # Single step (backward compat)
+    steps: Optional[List[Any]] = None  # Multiple steps (NEW)
     over: Optional[str] = None  # Variable name containing list
     from_csv: Optional[str] = None  # CSV file path
     from_file: Optional[str] = None  # Text file path (one item per line)
     var_name: str = "item"  # Variable name for current item
+    parallel: bool = False  # Execute iterations in parallel
+    max_workers: Optional[int] = None  # Max parallel workers (None = unlimited)
+    output_variable: Optional[str] = None  # Store loop results in this variable name
     
     def __init__(
         self, 
-        step: Any, 
+        step: Any = None,
+        steps: Optional[List[Any]] = None,
         over: Optional[str] = None,
         from_csv: Optional[str] = None,
         from_file: Optional[str] = None,
-        var_name: str = "item"
+        var_name: str = "item",
+        parallel: bool = False,
+        max_workers: Optional[int] = None,
+        output_variable: Optional[str] = None
     ):
+        # Validation: cannot have both step and steps
+        if step is not None and steps is not None:
+            raise ValueError("Cannot specify both 'step' and 'steps'")
+        # Validation: must have at least one
+        if step is None and steps is None:
+            raise ValueError("Loop requires 'step' or 'steps'")
+        # Validation: steps cannot be empty
+        if steps is not None and len(steps) == 0:
+            raise ValueError("Loop 'steps' cannot be empty")
+        
         self.step = step
+        self.steps = steps
         self.over = over
         self.from_csv = from_csv
         self.from_file = from_file
         self.var_name = var_name
+        self.parallel = parallel
+        self.max_workers = max_workers
+        self.output_variable = output_variable
 
 
 @dataclass
@@ -175,15 +322,148 @@ def parallel(steps: List) -> Parallel:
     """Execute steps in parallel."""
     return Parallel(steps=steps)
 
-def loop(step: Any, over: Optional[str] = None, from_csv: Optional[str] = None, 
-         from_file: Optional[str] = None, var_name: str = "item") -> Loop:
-    """Loop over items executing step for each."""
-    return Loop(step=step, over=over, from_csv=from_csv, from_file=from_file, var_name=var_name)
+def loop(step: Any = None, steps: Optional[List[Any]] = None,
+         over: Optional[str] = None, from_csv: Optional[str] = None, 
+         from_file: Optional[str] = None, var_name: str = "item",
+         parallel: bool = False, max_workers: Optional[int] = None,
+         output_variable: Optional[str] = None) -> Loop:
+    """Loop over items executing step(s) for each.
+    
+    Args:
+        step: Single step (agent/function) to execute for each item (backward compat)
+        steps: Multiple steps to execute sequentially for each item (NEW)
+        over: Variable name containing the list to iterate over
+        from_csv: Path to CSV file to read items from
+        from_file: Path to text file with one item per line
+        var_name: Variable name for current item (default: "item")
+        parallel: If True, execute iterations in parallel (default: False)
+        max_workers: Max parallel workers when parallel=True (default: None = unlimited)
+        output_variable: Variable name to store all loop outputs (default: None = "loop_outputs")
+    
+    Returns:
+        Loop object configured for iteration
+    """
+    return Loop(step=step, steps=steps, over=over, from_csv=from_csv, from_file=from_file, 
+                var_name=var_name, parallel=parallel, max_workers=max_workers,
+                output_variable=output_variable)
+
 
 def repeat(step: Any, until: Optional[Callable[[WorkflowContext], bool]] = None,
            max_iterations: int = 10) -> Repeat:
     """Repeat step until condition is met."""
     return Repeat(step=step, until=until, max_iterations=max_iterations)
+
+
+@dataclass
+class Include:
+    """
+    Include another recipe as a workflow step.
+    
+    Enables modular recipe composition - recipes can include other recipes.
+    
+    Usage:
+        workflow = Workflow(steps=[
+            content_writer,
+            include("wordpress-publisher"),  # Include another recipe
+        ])
+        
+    YAML syntax:
+        steps:
+          - agent: content_writer
+          - include: wordpress-publisher
+          
+        # Or with configuration:
+          - include:
+              recipe: wordpress-publisher
+              input: "{{previous_output}}"
+    """
+    recipe: str = ""  # Recipe name or path
+    input: Optional[str] = None  # Input override (default: previous_output)
+    
+    def __init__(self, recipe: str, input: Optional[str] = None):
+        self.recipe = recipe
+        self.input = input
+
+
+def include(recipe: str, input: Optional[str] = None) -> Include:
+    """Include another recipe as a workflow step."""
+    return Include(recipe=recipe, input=input)
+
+
+# Maximum nesting depth for patterns (prevents stack overflow)
+MAX_NESTING_DEPTH = 5
+
+
+@dataclass
+class If:
+    """
+    Conditional branching pattern for workflows.
+    
+    Evaluates a condition and executes either then_steps or else_steps.
+    
+    Usage:
+        workflow = Workflow(steps=[
+            if_(
+                condition="{{score}} > 80",
+                then_steps=[approve_step],
+                else_steps=[reject_step]
+            )
+        ])
+        
+    YAML syntax:
+        steps:
+          - if:
+              condition: "{{score}} > 80"
+              then:
+                - agent: approver
+              else:
+                - agent: rejector
+    
+    Supported condition formats:
+        - Numeric comparison: "{{var}} > 80", "{{var}} >= 50", "{{var}} < 10"
+        - String equality: "{{var}} == approved", "{{var}} != rejected"
+        - Contains check: "error in {{message}}", "{{status}} contains success"
+        - Boolean: "{{flag}}" (truthy check)
+    """
+    condition: str = ""  # Condition expression with {{var}} placeholders
+    then_steps: List[Any] = field(default_factory=list)  # Steps if condition is true
+    else_steps: Optional[List[Any]] = None  # Steps if condition is false (optional)
+    
+    def __init__(
+        self,
+        condition: str,
+        then_steps: List[Any],
+        else_steps: Optional[List[Any]] = None
+    ):
+        self.condition = condition
+        self.then_steps = then_steps
+        self.else_steps = else_steps or []
+
+
+def if_(
+    condition: str,
+    then_steps: List[Any],
+    else_steps: Optional[List[Any]] = None
+) -> If:
+    """
+    Create a conditional branching step.
+    
+    Args:
+        condition: Condition expression with {{var}} placeholders
+        then_steps: Steps to execute if condition is true
+        else_steps: Steps to execute if condition is false (optional)
+    
+    Returns:
+        If object for conditional execution
+    
+    Example:
+        if_(
+            condition="{{score}} > 80",
+            then_steps=[approve_agent],
+            else_steps=[reject_agent]
+        )
+    """
+    return If(condition=condition, then_steps=then_steps, else_steps=else_steps)
 
 
 @dataclass
@@ -555,6 +835,10 @@ class Workflow:
     default_agent_config: Optional[Dict[str, Any]] = None  # Default agent for all steps
     default_llm: Optional[str] = None  # Default LLM model
     
+    # Process type: "sequential" (default) or "hierarchical" (manager-based validation)
+    process: str = "sequential"  # "sequential", "hierarchical"
+    manager_llm: Optional[str] = None  # LLM for manager agent (hierarchical mode)
+    
     # ============================================================
     # CONSOLIDATED FEATURE PARAMS (workflow-centric API)
     # Precedence: Instance > Config > Array > Dict > String > Bool > Default
@@ -564,7 +848,7 @@ class Workflow:
     planning: Optional[Any] = False  # Union[bool, str, WorkflowPlanningConfig] - planning mode
     memory: Optional[Any] = None  # Union[bool, WorkflowMemoryConfig, instance] - memory
     hooks: Optional[Any] = None  # WorkflowHooksConfig - lifecycle callbacks
-    context: Optional[Any] = False  # Union[bool, ManagerConfig, ContextManager] - context management
+    context: Optional[Any] = True  # Union[bool, ManagerConfig, ContextManager] - context management (enabled by default for workflows)
     # NEW: Agent-like consolidated params for feature parity
     autonomy: Optional[Any] = None  # Union[bool, AutonomyConfig] - agent autonomy
     knowledge: Optional[Any] = None  # Union[bool, List[str], KnowledgeConfig] - RAG
@@ -581,6 +865,7 @@ class Workflow:
     # Private resolved fields (set in __post_init__)
     _verbose: bool = field(default=False, repr=False)
     _stream: bool = field(default=True, repr=False)
+    _output_config: Optional[Any] = field(default=None, repr=False)  # Full OutputConfig for propagation
     _planning_enabled: bool = field(default=False, repr=False)
     _planning_llm: Optional[str] = field(default=None, repr=False)
     _reasoning: bool = field(default=False, repr=False)
@@ -588,6 +873,7 @@ class Workflow:
     _hooks_config: Optional[Any] = field(default=None, repr=False)
     _context_manager: Optional[Any] = field(default=None, repr=False)
     _context_manager_initialized: bool = field(default=False, repr=False)
+    _session_dedup_cache: Optional[Any] = field(default=None, repr=False)  # Shared session deduplication cache
     # NEW: Resolved configs for agent-like params (for propagation to steps/agents)
     _autonomy_config: Optional[Any] = field(default=None, repr=False)
     _knowledge_config: Optional[Any] = field(default=None, repr=False)
@@ -602,10 +888,41 @@ class Workflow:
             resolve_memory_config, resolve_hooks_config,
         )
         
-        # Resolve output param
+        # Resolve output param - now uses OUTPUT_PRESETS (same as Agent)
         output_cfg = resolve_output_config(self.output)
-        self._verbose = output_cfg.verbose if output_cfg else False
-        self._stream = output_cfg.stream if output_cfg else True
+        self._output_config = output_cfg  # Store full config for propagation
+        self._verbose = getattr(output_cfg, 'verbose', False) if output_cfg else False
+        self._stream = getattr(output_cfg, 'stream', True) if output_cfg else True
+        
+        # Enable status/trace output if configured (same as Agent)
+        if output_cfg:
+            status_trace = getattr(output_cfg, 'status_trace', False)
+            actions_trace = getattr(output_cfg, 'actions_trace', False)
+            json_output = getattr(output_cfg, 'json_output', False)
+            simple_output = getattr(output_cfg, 'simple_output', False)
+            metrics = getattr(output_cfg, 'metrics', False)
+            
+            if status_trace:
+                try:
+                    from ..output.trace import enable_trace_output, is_trace_output_enabled
+                    if not is_trace_output_enabled():
+                        enable_trace_output(use_color=True, show_timestamps=True)
+                except ImportError:
+                    pass
+            elif actions_trace:
+                try:
+                    from ..output.status import enable_status_output, is_status_output_enabled
+                    if not is_status_output_enabled():
+                        output_format = "jsonl" if json_output else "text"
+                        enable_status_output(
+                            redact=True,
+                            use_color=True,
+                            format=output_format,
+                            show_timestamps=not simple_output,
+                            show_metrics=metrics
+                        )
+                except ImportError:
+                    pass
         
         # Resolve planning param
         planning_cfg = resolve_planning_config(self.planning)
@@ -679,6 +996,14 @@ class Workflow:
                 config_class=ReflectionConfig, presets=REFLECTION_PRESETS,
                 default=None,
             )
+        
+        # Initialize session deduplication cache for cross-agent deduplication
+        if self.context:
+            try:
+                from ..context.manager import SessionDeduplicationCache
+                self._session_dedup_cache = SessionDeduplicationCache()
+            except ImportError:
+                pass
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -689,6 +1014,8 @@ class Workflow:
             "file_path": self.file_path,
             "default_agent_config": self.default_agent_config,
             "default_llm": self.default_llm,
+            "process": self.process,
+            "manager_llm": self.manager_llm,
             "output": {"verbose": self._verbose, "stream": self._stream},
             "planning": {"enabled": self._planning_enabled, "llm": self._planning_llm, "reasoning": self._reasoning},
             "memory": self._memory_config.to_dict() if hasattr(self._memory_config, 'to_dict') else bool(self._memory_config),
@@ -700,6 +1027,11 @@ class Workflow:
     def verbose(self) -> bool:
         """Get verbose setting from resolved output config."""
         return self._verbose
+    
+    @verbose.setter
+    def verbose(self, value: bool):
+        """Set verbose setting."""
+        self._verbose = value
     
     @property
     def stream(self) -> bool:
@@ -719,8 +1051,11 @@ class Workflow:
     @property
     def memory_config(self) -> Optional[Dict[str, Any]]:
         """Get memory config dict for backward compatibility."""
-        if self._memory_config and hasattr(self._memory_config, 'to_dict'):
-            return self._memory_config.to_dict()
+        if self._memory_config:
+            if hasattr(self._memory_config, 'to_dict'):
+                return self._memory_config.to_dict()
+            elif isinstance(self._memory_config, dict):
+                return self._memory_config
         return None
     
     @property
@@ -747,6 +1082,53 @@ class Workflow:
     def on_step_error(self) -> Optional[Callable]:
         """Get on_step_error callback from hooks config."""
         return self._hooks_config.on_step_error if self._hooks_config else None
+    
+    def _resolve_pydantic_class(self, class_name: str) -> Optional[Any]:
+        """
+        Resolve a Pydantic class from string reference (Option B for structured output).
+        
+        Looks for the class in:
+        1. tools.py in the workflow's directory
+        2. The global namespace
+        
+        Args:
+            class_name: Name of the Pydantic class to resolve
+            
+        Returns:
+            The Pydantic class if found, None otherwise
+        """
+        import sys
+        
+        # Try to find the class in tools.py from the workflow's directory
+        if self.file_path:
+            from pathlib import Path
+            workflow_dir = Path(self.file_path).parent
+            tools_path = workflow_dir / "tools.py"
+            
+            if tools_path.exists():
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("tools", tools_path)
+                    if spec and spec.loader:
+                        tools_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(tools_module)
+                        
+                        if hasattr(tools_module, class_name):
+                            cls = getattr(tools_module, class_name)
+                            # Verify it's a Pydantic model
+                            if hasattr(cls, 'model_json_schema'):
+                                return cls
+                except Exception as e:
+                    logger.debug(f"Failed to load Pydantic class from tools.py: {e}")
+        
+        # Try to find in already-imported modules
+        for module_name, module in sys.modules.items():
+            if module and hasattr(module, class_name):
+                cls = getattr(module, class_name)
+                if hasattr(cls, 'model_json_schema'):
+                    return cls
+        
+        return None
     
     @classmethod
     def from_template(
@@ -852,6 +1234,13 @@ class Workflow:
         # Update workflow status
         self.status = "running"
         
+        # Set YAML-approved tools in approval context (for auto-approval of dangerous tools)
+        _approval_token = None
+        approve_tools = getattr(self, 'approve_tools', [])
+        if approve_tools:
+            from ..approval import set_yaml_approved_tools
+            _approval_token = set_yaml_approved_tools(approve_tools)
+        
         # Call on_workflow_start callback
         if self.on_workflow_start:
             try:
@@ -865,6 +1254,19 @@ class Workflow:
             if plan and verbose:
                 print(f"📋 Execution Plan: {plan}")
             all_variables["execution_plan"] = plan
+        
+        # Hierarchical mode - use manager-based validation
+        if self.process == "hierarchical":
+            if verbose:
+                print("🔄 Running workflow in hierarchical mode with manager validation")
+            return self._run_hierarchical(
+                input=input,
+                model=model,
+                verbose=verbose,
+                stream=stream,
+                all_variables=all_variables,
+                _approval_token=_approval_token
+            )
         
         # Process steps (may include Route, Parallel, Loop, Repeat)
         i = 0
@@ -913,6 +1315,28 @@ class Workflow:
                 results.extend(repeat_result["steps"])
                 previous_output = repeat_result["output"]
                 all_variables.update(repeat_result.get("variables", {}))
+                i += 1
+                continue
+                
+            elif isinstance(step, Include):
+                # Include another recipe
+                include_result = self._execute_include(
+                    step, previous_output, input, all_variables, model, verbose, stream
+                )
+                results.extend(include_result["steps"])
+                previous_output = include_result["output"]
+                all_variables.update(include_result.get("variables", {}))
+                i += 1
+                continue
+            
+            elif isinstance(step, If):
+                # Conditional branching
+                if_result = self._execute_if(
+                    step, previous_output, input, all_variables, model, verbose, stream
+                )
+                results.extend(if_result["steps"])
+                previous_output = if_result["output"]
+                all_variables.update(if_result.get("variables", {}))
                 i += 1
                 continue
             
@@ -982,6 +1406,17 @@ class Workflow:
                             
                     elif step.agent:
                         # Direct agent with tools
+                        # Propagate context management to existing agent if workflow has it enabled
+                        if self.context and hasattr(step.agent, '_context_manager_initialized'):
+                            if not step.agent._context_manager_initialized:
+                                step.agent._context_param = self.context
+                            # Share session deduplication cache for cross-agent deduplication
+                            if self._session_dedup_cache:
+                                step.agent._session_dedup_cache = self._session_dedup_cache
+                                # Also set on existing context manager if already initialized
+                                if step.agent._context_manager and hasattr(step.agent._context_manager, '_session_cache'):
+                                    step.agent._context_manager._session_cache = self._session_dedup_cache
+                        
                         # Substitute variables in action
                         action = step.action or input
                         for key, value in all_variables.items():
@@ -1002,23 +1437,68 @@ class Workflow:
                         if validation_feedback:
                             action = f"{action}\n\nPrevious attempt feedback: {validation_feedback}"
                         
-                        # Handle images if present
-                        step_images = getattr(step, 'images', None)
-                        if step_images:
-                            output = step.agent.chat(action, images=step_images, stream=stream)
+                        # Check if this is a specialized agent (AudioAgent, VideoAgent, ImageAgent, OCRAgent)
+                        agent_class_name = step.agent.__class__.__name__
+                        if agent_class_name in ('AudioAgent', 'VideoAgent', 'ImageAgent', 'OCRAgent', 'DeepResearchAgent'):
+                            # Use specialized agent dispatch
+                            output = self._execute_specialized_agent(
+                                step.agent, agent_class_name, action, step, all_variables, stream
+                            )
                         else:
-                            output = step.agent.chat(action, stream=stream)
-                        
-                        # Handle output_pydantic if present
-                        output_pydantic = getattr(step, 'output_pydantic', None)
-                        if output_pydantic and output:
-                            try:
-                                # Try to parse output as Pydantic model
-                                if hasattr(output_pydantic, 'model_validate_json'):
-                                    parsed = output_pydantic.model_validate_json(output)
-                                    output = parsed.model_dump_json()
-                            except Exception as e:
-                                logger.debug(f"Pydantic parsing failed: {e}")
+                            # Standard Agent with chat() method
+                            # Handle images/attachments if present - check step.images first, then variables
+                            step_attachments = getattr(step, 'images', None)
+                            if not step_attachments:
+                                # Check for image_path, image_url, or image in variables
+                                image_var = all_variables.get('image_path') or all_variables.get('image_url') or all_variables.get('image')
+                                if image_var:
+                                    step_attachments = [image_var] if isinstance(image_var, str) else image_var
+                                    logger.debug(f"Passing image attachment to agent: {image_var}")
+                            # Get structured output options from step
+                            step_output_json = getattr(step, '_output_json', None)
+                            step_output_pydantic = getattr(step, '_output_pydantic', None)
+                            
+                            # Resolve Pydantic class from string reference (Option B)
+                            # If output_pydantic is a string, try to resolve it from tools.py
+                            if step_output_pydantic and isinstance(step_output_pydantic, str):
+                                resolved_class = self._resolve_pydantic_class(step_output_pydantic)
+                                if resolved_class:
+                                    step_output_pydantic = resolved_class
+                                else:
+                                    logger.warning(f"Could not resolve Pydantic class '{step_output_pydantic}' from tools.py")
+                                    step_output_pydantic = None
+                            
+                            # Build chat kwargs
+                            chat_kwargs = {"stream": stream}
+                            if step_attachments:
+                                chat_kwargs["attachments"] = step_attachments
+                            if step_output_json:
+                                chat_kwargs["output_json"] = step_output_json
+                            if step_output_pydantic:
+                                chat_kwargs["output_pydantic"] = step_output_pydantic
+                            
+                            # Pass tool_choice from YAML if specified (auto, required, none)
+                            # This forces the LLM to use tools when tool_choice='required'
+                            yaml_tool_choice = getattr(step.agent, '_yaml_tool_choice', None)
+                            if yaml_tool_choice:
+                                chat_kwargs["tool_choice"] = yaml_tool_choice
+                            
+                            output = step.agent.chat(action, **chat_kwargs)
+                            
+                            # Parse JSON output if output_json was requested and output is a string
+                            if step_output_json and output and isinstance(output, str):
+                                output = _parse_json_output(output, step.name)
+                            
+                            # Handle output_pydantic if present
+                            output_pydantic = getattr(step, 'output_pydantic', None)
+                            if output_pydantic and output:
+                                try:
+                                    # Try to parse output as Pydantic model
+                                    if hasattr(output_pydantic, 'model_validate_json'):
+                                        parsed = output_pydantic.model_validate_json(output)
+                                        output = parsed.model_dump_json()
+                                except Exception as e:
+                                    logger.debug(f"Pydantic parsing failed: {e}")
                             
                     elif step.action:
                         # Action with agent_config - create temporary agent
@@ -1034,9 +1514,10 @@ class Workflow:
                             goal=config.get("goal", "Complete the task"),
                             llm=config.get("llm", model),
                             tools=step_tools if step_tools else None,
-                            # verbose parameter removed - Agent no longer accepts it
+                            output=self.output,  # Propagate output config to child agents
                             reasoning=self.reasoning,
-                            stream=stream
+                            stream=stream,
+                            context=self.context,  # Propagate context management to child agents
                         )
                         # Substitute variables in action
                         action = step.action
@@ -1059,6 +1540,11 @@ class Workflow:
                         
                         output = temp_agent.chat(action, stream=stream)
                         
+                        # Parse JSON output if output_json was requested
+                        step_output_json = getattr(step, '_output_json', None)
+                        if step_output_json and output and isinstance(output, str):
+                            output = _parse_json_output(output, step.name)
+                        
                 except Exception as e:
                     step_error = e
                     output = f"Error: {e}"
@@ -1068,8 +1554,8 @@ class Workflow:
                         except Exception:
                             pass
                 
-                # Check guardrail if present
-                guardrail = getattr(step, 'guardrail', None)
+                # Check guardrail if present (guardrails is canonical, guardrail is deprecated)
+                guardrail = getattr(step, 'guardrails', None) or getattr(step, 'guardrail', None)
                 if guardrail and output and not step_error:
                     try:
                         is_valid, feedback = guardrail(StepResult(output=output))
@@ -1144,10 +1630,35 @@ class Workflow:
             var_name = step.output_variable or f"{step.name}_output"
             all_variables[var_name] = output
             
+            # Validate output and warn about issues
+            if output is None:
+                logger.warning(f"⚠️  Step '{step.name}': Output is None. Agent may not have returned expected format.")
+                if verbose:
+                    print(f"⚠️  WARNING: Step '{step.name}' output is None!")
+            else:
+                # Check type against output_json schema if defined
+                expected_schema = getattr(step, '_output_json', None)
+                if expected_schema and isinstance(expected_schema, dict):
+                    expected_type = expected_schema.get('type')
+                    actual_type = type(output).__name__
+                    if expected_type == 'object' and not isinstance(output, dict):
+                        logger.warning(f"⚠️  Step '{step.name}': Expected object/dict, got {actual_type}")
+                        if verbose:
+                            print(f"⚠️  Step '{step.name}': Expected 'object', received '{actual_type}'")
+                    elif expected_type == 'array' and not isinstance(output, list):
+                        logger.warning(f"⚠️  Step '{step.name}': Expected array/list, got {actual_type}")
+                        if verbose:
+                            print(f"⚠️  Step '{step.name}': Expected 'array', received '{actual_type}'")
+            
             i += 1
         
         # Update workflow status
         self.status = "completed"
+        
+        # Reset YAML-approved tools context if it was set
+        if _approval_token is not None:
+            from ..approval import reset_yaml_approved_tools
+            reset_yaml_approved_tools(_approval_token)
         
         final_result = {
             "output": previous_output,
@@ -1184,10 +1695,12 @@ class Workflow:
         import asyncio
         
         # Run the synchronous version in a thread pool
+        # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+        from ..trace.context_events import copy_context_to_callable
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: self.run(input, llm, verbose)
+            copy_context_to_callable(lambda: self.run(input, llm, verbose))
         )
         return result
     
@@ -1200,34 +1713,231 @@ class Workflow:
         """Alias for astart() for backward compatibility."""
         return await self.astart(input, llm, verbose)
     
+    def _run_hierarchical(
+        self,
+        input: str,
+        model: str,
+        verbose: bool,
+        stream: bool,
+        all_variables: Dict[str, Any],
+        _approval_token: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """Run workflow with hierarchical manager-based validation.
+        
+        In hierarchical mode, a manager agent validates each step's output
+        before proceeding to the next step. If the manager rejects a step,
+        the workflow stops with status='failed' and includes a failure_reason.
+        
+        This pattern is adapted from Process.hierarchical() for Workflow use.
+        
+        Args:
+            input: The workflow input
+            model: LLM model to use for steps
+            verbose: Print step outputs
+            stream: Enable streaming
+            all_variables: Variables dict
+            _approval_token: Token for YAML-approved tools
+            
+        Returns:
+            Dict with output, steps, variables, status, and optionally failure_reason
+        """
+        from ..llm import LLM
+        
+        results = []
+        previous_output = input
+        failure_reason = None
+        
+        manager_model = self.manager_llm or model
+        
+        normalized_steps = self._normalize_steps()
+        
+        for i, step in enumerate(normalized_steps):
+            step_name = getattr(step, 'name', f'step_{i}')
+            
+            if self.on_step_start:
+                try:
+                    self.on_step_start(self, step, i)
+                except Exception as e:
+                    logger.error(f"on_step_start callback failed: {e}")
+            
+            if hasattr(step, 'status'):
+                step.status = "running"
+            self.step_statuses[step_name] = "running"
+            
+            try:
+                # Use _execute_single_step_internal which returns a dict
+                step_result_internal = self._execute_single_step_internal(
+                    step, previous_output, input, all_variables, model, verbose, i, stream
+                )
+                output = step_result_internal.get("output", "")
+                stop = step_result_internal.get("stop", False)
+                step_vars = step_result_internal.get("variables", {})
+                all_variables.update(step_vars)
+                
+                step_result = {
+                    "step": step_name,
+                    "output": output,
+                    "status": "completed"
+                }
+                results.append(step_result)
+                
+                if hasattr(step, 'status'):
+                    step.status = "completed"
+                self.step_statuses[step_name] = "completed"
+                
+                if self.on_step_complete:
+                    try:
+                        self.on_step_complete(self, step, step_result)
+                    except Exception as e:
+                        logger.error(f"on_step_complete callback failed: {e}")
+                
+                if stop:
+                    if verbose:
+                        print(f"🛑 Workflow stopped at: {step_name}")
+                    break
+                
+                # Check if step has tools assigned
+                step_has_tools = bool(getattr(step, 'tools', None) or (hasattr(step, 'agent') and getattr(step.agent, 'tools', None)))
+                
+                # Build tool evidence guidance for manager
+                tool_evidence_guidance = ""
+                if step_has_tools:
+                    tool_evidence_guidance = """
+4. TOOL USAGE EVIDENCE: If the step required tool usage (e.g., search_web), check for EVIDENCE in the output:
+   - URLs or links (e.g., https://..., [Source](url))
+   - Structured data with sources/citations
+   - Specific facts with references
+   - Multiple distinct items from external sources
+   NOTE: The agent may have called tools successfully even if it doesn't say "I called the tool".
+   Look for RESULTS from tools, not explicit statements about calling them."""
+                
+                validation_prompt = f"""You are reviewing the output of a workflow step.
+
+Step Name: {step_name}
+Step Action: {getattr(step, 'action', 'Execute task')}
+Expected Output: {getattr(step, 'expected_output', 'Task completed successfully')}
+
+Agent Output:
+{output}
+
+Did this step complete successfully? Consider:
+1. Does the output address the task?
+2. Is the output meaningful (not an error message)?
+3. Does it meet the expected output criteria?{tool_evidence_guidance}
+
+IMPORTANT: Approve if the output contains substantive content that addresses the task.
+Only reject if the output is clearly an error, empty, or completely off-topic.
+
+Respond with JSON: {{"approved": true/false, "reason": "Brief explanation"}}
+"""
+                
+                try:
+                    llm_instance = LLM(model=manager_model, verbose=False)
+                    validation_response = llm_instance.get_response(
+                        prompt=validation_prompt,
+                        system_prompt="You are a workflow quality manager. Respond only with valid JSON.",
+                        output_json=True
+                    )
+                    
+                    if isinstance(validation_response, str):
+                        import json
+                        try:
+                            decision_data = json.loads(validation_response)
+                        except json.JSONDecodeError:
+                            decision_data = {"approved": True, "reason": "Could not parse response, assuming success"}
+                    elif isinstance(validation_response, dict):
+                        decision_data = validation_response
+                    else:
+                        decision_data = {"approved": True, "reason": "Unknown response format, assuming success"}
+                    
+                    approved = decision_data.get("approved", True)
+                    reason = decision_data.get("reason", "No reason provided")
+                    
+                    if verbose:
+                        status_icon = "✅" if approved else "❌"
+                        print(f"{status_icon} Manager validation for '{step_name}': {reason}")
+                    
+                    if not approved:
+                        failure_reason = f"Manager rejected step '{step_name}': {reason}"
+                        self.status = "failed"
+                        if hasattr(step, 'status'):
+                            step.status = "failed"
+                        self.step_statuses[step_name] = "failed"
+                        step_result["status"] = "failed"
+                        step_result["failure_reason"] = failure_reason
+                        
+                        if self.on_step_error:
+                            try:
+                                self.on_step_error(self, step, Exception(failure_reason))
+                            except Exception as e:
+                                logger.error(f"on_step_error callback failed: {e}")
+                        break
+                        
+                except Exception as e:
+                    logger.warning(f"Manager validation failed for step '{step_name}': {e}. Continuing workflow.")
+                
+                previous_output = output
+                
+                # Store output in variables for next step's variable substitution
+                # This is critical for {{agent_name}}_output references to work
+                var_name = f"{step_name}_output"
+                all_variables[var_name] = output
+                
+            except Exception as e:
+                error_msg = str(e)
+                if hasattr(step, 'status'):
+                    step.status = "failed"
+                self.step_statuses[step_name] = "failed"
+                
+                step_result = {
+                    "step": step_name,
+                    "output": f"Error: {error_msg}",
+                    "status": "failed"
+                }
+                results.append(step_result)
+                
+                if self.on_step_error:
+                    try:
+                        self.on_step_error(self, step, e)
+                    except Exception as callback_e:
+                        logger.error(f"on_step_error callback failed: {callback_e}")
+                
+                failure_reason = f"Step '{step_name}' failed with error: {error_msg}"
+                self.status = "failed"
+                break
+        
+        if failure_reason is None:
+            self.status = "completed"
+        
+        if _approval_token is not None:
+            from ..approval import reset_yaml_approved_tools
+            reset_yaml_approved_tools(_approval_token)
+        
+        final_result = {
+            "output": previous_output,
+            "steps": results,
+            "variables": all_variables,
+            "status": self.status
+        }
+        
+        if failure_reason:
+            final_result["failure_reason"] = failure_reason
+        
+        if self.on_workflow_complete:
+            try:
+                self.on_workflow_complete(self, final_result)
+            except Exception as e:
+                logger.error(f"on_workflow_complete callback failed: {e}")
+        
+        return final_result
+    
     def _normalize_steps(self) -> List['WorkflowStep']:
-        """Convert mixed steps (Agent, function, WorkflowStep) to WorkflowStep list."""
-        normalized = []
+        """Convert mixed steps (Agent, function, WorkflowStep) to WorkflowStep list.
         
-        for i, step in enumerate(self.steps):
-            if isinstance(step, WorkflowStep):
-                normalized.append(step)
-            elif callable(step):
-                # It's a function - wrap as handler
-                normalized.append(WorkflowStep(
-                    name=getattr(step, '__name__', f'step_{i+1}'),
-                    handler=step
-                ))
-            elif hasattr(step, 'chat'):
-                # It's an Agent - wrap with agent reference
-                normalized.append(WorkflowStep(
-                    name=getattr(step, 'name', f'agent_{i+1}'),
-                    agent=step,
-                    action="{{input}}"
-                ))
-            else:
-                # Unknown type - try to use as string action
-                normalized.append(WorkflowStep(
-                    name=f'step_{i+1}',
-                    action=str(step)
-                ))
-        
-        return normalized
+        This method uses _normalize_single_step to ensure consistent normalization
+        and avoid duplicated code paths (DRY principle).
+        """
+        return [self._normalize_single_step(step, i) for i, step in enumerate(self.steps)]
     
     def _create_plan(self, input: str, model: str, verbose: bool) -> Optional[str]:
         """Create an execution plan for the workflow using LLM.
@@ -1287,30 +1997,177 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
             logger.error(f"Planning failed: {e}")
             return None
     
+    def _execute_specialized_agent(
+        self,
+        agent: Any,
+        agent_class_name: str,
+        action: str,
+        step: 'WorkflowStep',
+        variables: Dict[str, Any],
+        stream: bool
+    ) -> Any:
+        """
+        Execute a specialized agent (AudioAgent, VideoAgent, ImageAgent, OCRAgent).
+        
+        Dispatches to the appropriate method based on agent type and action.
+        Falls back to chat() for standard Agent class.
+        
+        Args:
+            agent: The agent instance
+            agent_class_name: Name of the agent class
+            action: The action/prompt to execute
+            step: The workflow step containing additional config
+            variables: Current workflow variables
+            stream: Whether to stream output
+            
+        Returns:
+            Output from the agent execution
+        """
+        # Get yaml_action which specifies the method to call
+        yaml_action = getattr(agent, '_yaml_action', None) or action
+        
+        # AudioAgent - TTS (speech) or STT (transcribe)
+        if agent_class_name == 'AudioAgent':
+            if yaml_action == 'speech' or 'speech' in yaml_action.lower():
+                # Text-to-Speech
+                text = variables.get('text', action)
+                output_file = variables.get('output') or variables.get('audio_output') or 'output.mp3'
+                voice = variables.get('voice', 'alloy')
+                result = agent.speech(text, output=output_file, voice=voice)
+                # Store the output file path in variables for next step
+                variables['_last_audio_file'] = output_file
+                return result
+            elif yaml_action == 'transcribe' or 'transcribe' in yaml_action.lower():
+                # Speech-to-Text - check multiple variable names for input file
+                input_file = (
+                    variables.get('audio_file') or 
+                    variables.get('audio') or 
+                    variables.get('_last_audio_file') or  # From previous TTS step
+                    variables.get('input')
+                )
+                # If input is empty string or template, use default
+                if not input_file or input_file == '{{input}}' or 'Context from previous' in str(input_file):
+                    input_file = 'output.mp3'  # Default TTS output
+                language = variables.get('language', 'en')
+                return agent.transcribe(input_file, language=language)
+            else:
+                # Default to speech if action contains text
+                return agent.speech(action, output=variables.get('output', 'output.mp3'))
+        
+        # VideoAgent - generate
+        elif agent_class_name == 'VideoAgent':
+            prompt = variables.get('prompt', action)
+            output_file = variables.get('output', 'output.mp4')
+            return agent.generate(prompt, output=output_file)
+        
+        # ImageAgent - generate with output path support
+        elif agent_class_name == 'ImageAgent':
+            prompt = variables.get('prompt', action)
+            output_path = variables.get('output') or variables.get('image_output')
+            result = agent.generate(prompt)
+            # Extract URL from result and store in variables for next step
+            if hasattr(result, 'data') and result.data:
+                image_url = result.data[0].url if hasattr(result.data[0], 'url') else None
+                if image_url:
+                    variables['_last_image_url'] = image_url
+                    # Save to file if output path specified
+                    if output_path:
+                        try:
+                            import urllib.request
+                            urllib.request.urlretrieve(image_url, output_path)
+                            variables['_last_image_file'] = output_path
+                        except Exception as e:
+                            logger.warning(f"Failed to save image to {output_path}: {e}")
+            return result
+        
+        # OCRAgent - extract with retry logic for external API failures
+        elif agent_class_name == 'OCRAgent':
+            source = variables.get('source') or variables.get('url') or variables.get('document')
+            # If no explicit source variable, try to extract URL from action text
+            if not source:
+                import re
+                url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+                urls = re.findall(url_pattern, action)
+                source = urls[0] if urls else action
+            
+            # Retry logic for external API failures
+            max_retries = 2
+            last_error = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return agent.extract(source)
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+                    # Only retry on transient errors (network, timeout, fetch failures)
+                    if any(x in error_str for x in ['fetch', 'timeout', 'connection', 'network']):
+                        if attempt < max_retries:
+                            import time
+                            time.sleep(1 * (attempt + 1))  # Exponential backoff
+                            continue
+                    # Non-retryable error, raise immediately
+                    raise
+            # All retries exhausted
+            raise last_error
+        
+        # DeepResearchAgent - research
+        elif agent_class_name == 'DeepResearchAgent':
+            query = variables.get('query', action)
+            return agent.research(query)
+        
+        # Default: standard Agent with chat() method
+        else:
+            return agent.chat(action, stream=stream)
+    
     def _normalize_single_step(self, step: Any, index: int) -> 'WorkflowStep':
         """Normalize a single step to WorkflowStep.
         
         Supports:
         - WorkflowStep objects (passed through)
         - Agent objects (wrapped with agent reference and tools)
+        - Specialized agents (AudioAgent, VideoAgent, ImageAgent, OCRAgent)
         - Callable functions (wrapped as handler)
         - Strings (used as action)
         """
         if isinstance(step, WorkflowStep):
             return step
-        elif hasattr(step, 'chat'):
+        
+        # Check for standard Agent (has chat method) or specialized agents
+        agent_class_name = step.__class__.__name__
+        is_specialized_agent = agent_class_name in ('AudioAgent', 'VideoAgent', 'ImageAgent', 'OCRAgent', 'DeepResearchAgent')
+        
+        if hasattr(step, 'chat') or is_specialized_agent:
             # It's an Agent - wrap with agent reference and preserve tools
             agent_tools = getattr(step, 'tools', None)
             # Check for _yaml_action from YAML parser (canonical: action, alias: description)
             yaml_action = getattr(step, '_yaml_action', None)
+            # Check for _yaml_output_variable from YAML parser
+            yaml_output_variable = getattr(step, '_yaml_output_variable', None)
+            # Check for _yaml_output_json from YAML parser (structured output - Option A)
+            yaml_output_json = getattr(step, '_yaml_output_json', None)
+            # Check for _yaml_output_pydantic from YAML parser (structured output - Option B)
+            yaml_output_pydantic = getattr(step, '_yaml_output_pydantic', None)
+            # Check for _yaml_step_name from YAML parser
+            yaml_step_name = getattr(step, '_yaml_step_name', None)
             # Use yaml_action if set, otherwise fall back to previous_output/input
             default_action = "{{previous_output}}" if index > 0 else "{{input}}"
             action = yaml_action if yaml_action else default_action
+            # Build output config with all structured output options
+            output_config = {}
+            if yaml_output_variable:
+                output_config["variable"] = yaml_output_variable
+            if yaml_output_json:
+                output_config["json_model"] = yaml_output_json
+            if yaml_output_pydantic:
+                output_config["pydantic_model"] = yaml_output_pydantic
+            # Only pass output_config if it has values
+            output_config = output_config if output_config else None
             return WorkflowStep(
-                name=getattr(step, 'name', f'agent_{index+1}'),
+                name=yaml_step_name or getattr(step, 'name', f'agent_{index+1}'),
                 agent=step,
                 tools=agent_tools,
-                action=action
+                action=action,
+                output=output_config
             )
         elif callable(step):
             return WorkflowStep(
@@ -1332,9 +2189,102 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         model: str,
         verbose: bool,
         index: int = 0,
-        stream: bool = True
+        stream: bool = True,
+        depth: int = 0
     ) -> Dict[str, Any]:
-        """Execute a single step and return result."""
+        """Execute a single step and return result.
+        
+        Args:
+            step: The step to execute (Agent, function, or pattern like Loop/Parallel/Route/If)
+            previous_output: Output from previous step
+            input: Original workflow input
+            all_variables: Current workflow variables
+            model: LLM model to use
+            verbose: Whether to print verbose output
+            index: Step index
+            stream: Whether to stream responses
+            depth: Current nesting depth (for pattern recursion safety)
+        
+        Returns:
+            Dict with 'step', 'output', 'stop', 'variables'
+        """
+        # Check nesting depth limit for nested patterns
+        if depth > MAX_NESTING_DEPTH:
+            raise ValueError(
+                f"Maximum nesting depth ({MAX_NESTING_DEPTH}) exceeded. "
+                "Simplify your workflow or reduce pattern nesting."
+            )
+        
+        # Handle nested patterns (Loop, Parallel, Route, Repeat, If)
+        if isinstance(step, Loop):
+            loop_result = self._execute_loop(
+                step, previous_output, input, all_variables, model, verbose, stream, depth=depth+1
+            )
+            return {
+                "step": f"loop_{index}",
+                "output": loop_result.get("output", ""),
+                "stop": False,
+                "variables": loop_result.get("variables", all_variables)
+            }
+        
+        if isinstance(step, Parallel):
+            parallel_result = self._execute_parallel(
+                step, previous_output, input, all_variables, model, verbose, stream, depth=depth+1
+            )
+            return {
+                "step": f"parallel_{index}",
+                "output": parallel_result.get("output", ""),
+                "stop": False,
+                "variables": parallel_result.get("variables", all_variables)
+            }
+        
+        if isinstance(step, Route):
+            route_result = self._execute_route(
+                step, previous_output, input, all_variables, model, verbose, stream, depth=depth+1
+            )
+            return {
+                "step": f"route_{index}",
+                "output": route_result.get("output", ""),
+                "stop": False,
+                "variables": route_result.get("variables", all_variables)
+            }
+        
+        if isinstance(step, Repeat):
+            repeat_result = self._execute_repeat(
+                step, previous_output, input, all_variables, model, verbose, stream, depth=depth+1
+            )
+            return {
+                "step": f"repeat_{index}",
+                "output": repeat_result.get("output", ""),
+                "stop": False,
+                "variables": repeat_result.get("variables", all_variables)
+            }
+        
+        if isinstance(step, If):
+            if_result = self._execute_if(
+                step, previous_output, input, all_variables, model, verbose, stream, depth=depth+1
+            )
+            return {
+                "step": f"if_{index}",
+                "output": if_result.get("output", ""),
+                "stop": False,
+                "variables": if_result.get("variables", all_variables)
+            }
+        
+        # Handle Include steps (for include inside loop)
+        if isinstance(step, Include):
+            include_result = self._execute_include(
+                step, previous_output, input, all_variables, model, verbose, stream
+            )
+            # Return in the expected format for single step
+            combined_output = include_result.get("output", "")
+            return {
+                "step": f"include:{step.recipe}",
+                "output": combined_output,
+                "stop": False,
+                "variables": include_result.get("variables", all_variables)
+            }
+        
         normalized = self._normalize_single_step(step, index)
         
         context = WorkflowContext(
@@ -1361,6 +2311,17 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                 output = f"Error: {e}"
         elif normalized.agent:
             try:
+                # Propagate context management to existing agent if workflow has it enabled
+                if self.context and hasattr(normalized.agent, '_context_manager_initialized'):
+                    if not normalized.agent._context_manager_initialized:
+                        normalized.agent._context_param = self.context
+                    # Share session deduplication cache for cross-agent deduplication
+                    if self._session_dedup_cache:
+                        normalized.agent._session_dedup_cache = self._session_dedup_cache
+                        # Also set on existing context manager if already initialized
+                        if normalized.agent._context_manager and hasattr(normalized.agent._context_manager, '_session_cache'):
+                            normalized.agent._context_manager._session_cache = self._session_dedup_cache
+                
                 action = normalized.action or input
                 # Substitute variables
                 for key, value in all_variables.items():
@@ -1372,7 +2333,17 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                         # Auto-append context if not explicitly referenced
                         action = f"{action}\n\nContext from previous step:\n{previous_output}"
                 action = action.replace("{{input}}", input)
-                output = normalized.agent.chat(action, stream=stream)
+                
+                # Check if this is a specialized agent (AudioAgent, VideoAgent, ImageAgent, OCRAgent)
+                agent_class_name = normalized.agent.__class__.__name__
+                output = self._execute_specialized_agent(
+                    normalized.agent, agent_class_name, action, normalized, all_variables, stream
+                )
+                
+                # Parse JSON output if output_json was requested
+                step_output_json = getattr(normalized, '_output_json', None)
+                if step_output_json and output and isinstance(output, str):
+                    output = _parse_json_output(output, normalized.name)
             except Exception as e:
                 output = f"Error: {e}"
         elif normalized.action:
@@ -1384,8 +2355,8 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                     role=config.get("role", "Assistant"),
                     goal=config.get("goal", "Complete the task"),
                     llm=config.get("llm", model),
-                    # verbose parameter removed - Agent no longer accepts it
-                    stream=stream
+                    stream=stream,
+                    context=self.context,  # Propagate context management to child agents
                 )
                 action = normalized.action
                 for key, value in all_variables.items():
@@ -1398,6 +2369,11 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                         action = f"{action}\n\nContext from previous step:\n{previous_output}"
                 
                 output = temp_agent.chat(action, stream=stream)
+                
+                # Parse JSON output if output_json was requested
+                step_output_json = getattr(normalized, '_output_json', None)
+                if step_output_json and output and isinstance(output, str):
+                    output = _parse_json_output(output, normalized.name)
             except Exception as e:
                 output = f"Error: {e}"
         
@@ -1419,7 +2395,8 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         all_variables: Dict[str, Any],
         model: str,
         verbose: bool,
-        stream: bool = True
+        stream: bool = True,
+        depth: int = 0
     ) -> Dict[str, Any]:
         """Execute routing based on previous output."""
         results = []
@@ -1445,7 +2422,7 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         # Execute matched route steps
         for idx, step in enumerate(matched_route):
             step_result = self._execute_single_step_internal(
-                step, output, input, all_variables, model, verbose, idx, stream=stream
+                step, output, input, all_variables, model, verbose, idx, stream=stream, depth=depth+1
             )
             results.append({"step": step_result["step"], "output": step_result["output"]})
             output = step_result["output"]
@@ -1456,6 +2433,57 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         
         return {"steps": results, "output": output, "variables": all_variables}
     
+    def _llm_summarize_for_parallel(
+        self,
+        content: str,
+        num_branches: int,
+        model: str,
+        verbose: bool = False
+    ) -> str:
+        """
+        Use LLM to create a concise summary of content for parallel distribution.
+        
+        This reduces token usage when the same context is passed to multiple parallel branches.
+        """
+        from ..context.tokens import estimate_tokens_heuristic
+        
+        # Only summarize if content is large enough
+        tokens = estimate_tokens_heuristic(content)
+        if tokens < 1500:
+            return content
+        
+        # Target summary size: ~500 tokens to leave room for each branch's work
+        target_tokens = min(500, tokens // num_branches)
+        
+        try:
+            import litellm
+            
+            prompt = f"""Summarize the following content concisely, preserving all key information, data, and actionable items. 
+Keep the summary under {target_tokens * 4} characters. Focus on facts, numbers, and specific details.
+
+CONTENT:
+{content[:8000]}
+
+CONCISE SUMMARY:"""
+            
+            response = litellm.completion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=target_tokens,
+                temperature=0.1,
+            )
+            
+            summary = response.choices[0].message.content.strip()
+            
+            if verbose:
+                print(f"  🤖 LLM summarized context: {tokens:,} → {estimate_tokens_heuristic(summary):,} tokens")
+            
+            return summary
+            
+        except Exception as e:
+            logger.debug(f"LLM summarization failed, using truncation: {e}")
+            raise  # Let caller handle fallback
+    
     def _execute_parallel(
         self,
         parallel_step: Parallel,
@@ -1464,7 +2492,8 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         all_variables: Dict[str, Any],
         model: str,
         verbose: bool,
-        stream: bool = True
+        stream: bool = True,
+        depth: int = 0
     ) -> Dict[str, Any]:
         """Execute steps in parallel (simulated with sequential for now)."""
         import concurrent.futures
@@ -1475,14 +2504,48 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         if verbose:
             print(f"⚡ Running {len(parallel_step.steps)} steps in parallel...")
         
+        # Optimize: Use LLM-based summarization before distributing to parallel branches
+        # This prevents rate limits and reduces token waste
+        optimized_previous = previous_output
+        num_branches = len(parallel_step.steps)
+        if previous_output and len(previous_output) > 3000:
+            from ..context.tokens import estimate_tokens_heuristic
+            tokens = estimate_tokens_heuristic(previous_output)
+            if tokens > 1000:
+                # Try LLM-based summarization first, fall back to truncation
+                try:
+                    optimized_previous = self._llm_summarize_for_parallel(previous_output, num_branches, model, verbose)
+                except Exception:
+                    # Fallback to truncation-based summarization
+                    max_chars = min(2500, len(previous_output) // max(num_branches, 2))
+                    if len(previous_output) > max_chars:
+                        optimized_previous = previous_output[:max_chars * 2 // 3] + "\n\n[... context summarized for parallel efficiency ...]\n\n" + previous_output[-max_chars // 3:]
+                
+                if verbose and optimized_previous != previous_output:
+                    new_tokens = estimate_tokens_heuristic(optimized_previous)
+                    saved = tokens - new_tokens
+                    print(f"  📦 Optimized context for {num_branches} parallel branches: {tokens:,} → {new_tokens:,} tokens (saved {saved:,} per branch)")
+        
         # Use ThreadPoolExecutor for parallel execution
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(parallel_step.steps)) as executor:
+        # IMPORTANT: Limit max_workers to prevent rate limit issues (max 3 concurrent branches)
+        from ..trace.context_events import copy_context_to_callable, get_context_emitter
+        
+        effective_workers = min(3, len(parallel_step.steps))  # Cap at 3 to prevent rate limits
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
             futures = []
             for idx, step in enumerate(parallel_step.steps):
-                future = executor.submit(
-                    self._execute_single_step_internal,
-                    step, previous_output, input, all_variables.copy(), model, False, idx, stream
-                )
+                # Wrap execution to propagate context and set branch_id for parallel tracking
+                def execute_with_branch(step=step, idx=idx, opt_prev=optimized_previous):
+                    emitter = get_context_emitter()
+                    emitter.set_branch(f"parallel_{idx}")
+                    try:
+                        return self._execute_single_step_internal(
+                            step, opt_prev, input, all_variables.copy(), model, False, idx, stream, depth=depth+1
+                        )
+                    finally:
+                        emitter.clear_branch()
+                
+                future = executor.submit(copy_context_to_callable(execute_with_branch))
                 futures.append((idx, future))
             
             for idx, future in futures:
@@ -1511,10 +2574,16 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         all_variables: Dict[str, Any],
         model: str,
         verbose: bool,
-        stream: bool = True
+        stream: bool = True,
+        depth: int = 0
     ) -> Dict[str, Any]:
-        """Execute step for each item in loop."""
+        """Execute step for each item in loop.
+        
+        When loop_step.parallel is True, executes iterations concurrently
+        using ThreadPoolExecutor for faster processing.
+        """
         import csv
+        import concurrent.futures
         
         results = []
         outputs = []
@@ -1524,7 +2593,8 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         if loop_step.over:
             items = all_variables.get(loop_step.over, [])
             if isinstance(items, str):
-                items = [items]
+                # Try to parse as JSON list first (handles agent output like '["a", "b", "c"]')
+                items = self._parse_list_from_string(items)
         elif loop_step.from_csv:
             try:
                 with open(loop_step.from_csv, 'r', encoding='utf-8') as f:
@@ -1541,26 +2611,233 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
                 logger.error(f"Failed to read file {loop_step.from_file}: {e}")
                 items = []
         
-        if verbose:
-            print(f"🔁 Looping over {len(items)} items...")
+        num_items = len(items)
         
-        for idx, item in enumerate(items):
-            # Add current item to variables
-            loop_vars = all_variables.copy()
-            loop_vars[loop_step.var_name] = item
-            loop_vars["loop_index"] = idx
+        # Determine steps to run (multi-step or single step)
+        steps_to_run = loop_step.steps if loop_step.steps else [loop_step.step]
+        is_multi_step = loop_step.steps is not None and len(loop_step.steps) > 1
+        
+        if loop_step.parallel and num_items > 1:
+            # Parallel execution - cap workers to prevent rate limits
+            max_workers = min(loop_step.max_workers or num_items, 3)  # Cap at 3 to prevent rate limits
+            if verbose:
+                step_info = f" ({len(steps_to_run)} steps each)" if is_multi_step else ""
+                print(f"⚡🔁 Parallel looping over {num_items} items{step_info} (max_workers={max_workers})...")
             
-            step_result = self._execute_single_step_internal(
-                loop_step.step, previous_output, input, loop_vars, model, verbose, idx, stream=stream
-            )
-            results.append({"step": f"{step_result['step']}_{idx}", "output": step_result["output"]})
-            outputs.append(step_result["output"])
-            previous_output = step_result["output"]
-        
-        all_variables["loop_outputs"] = outputs
+            # Optimize: Aggressively summarize large previous_output before distributing to parallel branches
+            # This reduces token waste and prevents rate limit issues
+            optimized_previous = previous_output
+            if previous_output and len(previous_output) > 3000:
+                from ..context.tokens import estimate_tokens_heuristic
+                tokens = estimate_tokens_heuristic(previous_output)
+                # Target: max 800 tokens per branch to stay well under rate limits
+                if tokens > 1000:
+                    max_chars = min(2500, len(previous_output) // max(num_items, 2))
+                    if len(previous_output) > max_chars:
+                        # Extract key information: first part (context) + last part (recent output)
+                        optimized_previous = previous_output[:max_chars * 2 // 3] + "\n\n[... context summarized for parallel efficiency ...]\n\n" + previous_output[-max_chars // 3:]
+                        if verbose:
+                            new_tokens = estimate_tokens_heuristic(optimized_previous)
+                            saved = tokens - new_tokens
+                            print(f"  📦 Optimized context for {num_items} parallel branches: {tokens:,} → {new_tokens:,} tokens (saved {saved:,} per branch)")
+            
+            # Use copy_context_to_callable to propagate contextvars (needed for trace emission)
+            from ..trace.context_events import copy_context_to_callable, get_context_emitter
+            
+            def execute_item(idx_item_tuple, opt_prev=optimized_previous):
+                """Execute step(s) for a single item in thread."""
+                idx, item = idx_item_tuple
+                
+                # Set branch context for parallel tracking
+                emitter = get_context_emitter()
+                emitter.set_branch(f"loop_{idx}")
+                
+                try:
+                    # CRITICAL: Deep copy variables to ensure thread isolation (per-branch context isolation)
+                    import copy
+                    loop_vars = copy.deepcopy(all_variables)
+                    loop_vars[loop_step.var_name] = item
+                    loop_vars["loop_index"] = idx
+                    
+                    # Also expand nested item properties for template access (e.g., {{item.title}})
+                    if isinstance(item, dict):
+                        for key, value in item.items():
+                            loop_vars[f"{loop_step.var_name}.{key}"] = value
+                    
+                    # Execute all steps sequentially within this iteration
+                    iteration_output = opt_prev
+                    iteration_results = []
+                    for step_idx, step in enumerate(steps_to_run):
+                        step_result = self._execute_single_step_internal(
+                            step, iteration_output, input, loop_vars, model, False, step_idx, stream=False, depth=depth+1
+                        )
+                        iteration_output = step_result.get("output")
+                        iteration_results.append(step_result)
+                        # Update variables if step set any
+                        if step_result.get("variables"):
+                            loop_vars.update(step_result["variables"])
+                    
+                    # Return final output (last step's output)
+                    final_result = {
+                        "step": f"loop_{idx}",
+                        "output": iteration_output,
+                        "steps": iteration_results
+                    }
+                    return idx, final_result
+                finally:
+                    emitter.clear_branch()
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(copy_context_to_callable(lambda pair=(idx, item): execute_item(pair)))
+                    for idx, item in enumerate(items)
+                ]
+                
+                # Collect results in order
+                indexed_results = []
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        idx, step_result = future.result()
+                        indexed_results.append((idx, step_result))
+                        if verbose:
+                            print(f"  ✓ Item {idx + 1}/{num_items} complete")
+                    except Exception as e:
+                        logger.error(f"Parallel loop iteration failed: {e}")
+                        indexed_results.append((idx, {"step": f"loop_{idx}", "output": f"Error: {e}"}))
+                
+                # Sort by index to maintain order
+                indexed_results.sort(key=lambda x: x[0])
+                
+                for idx, step_result in indexed_results:
+                    results.append({"step": f"{step_result['step']}_{idx}", "output": step_result["output"]})
+                    outputs.append(step_result["output"])
+            
+            if verbose:
+                print(f"✅ Parallel loop complete: {len(outputs)} results")
+        else:
+            # Sequential execution (original behavior)
+            if verbose:
+                step_info = f" ({len(steps_to_run)} steps each)" if is_multi_step else ""
+                print(f"🔁 Looping over {num_items} items{step_info}...")
+            
+            for idx, item in enumerate(items):
+                # Add current item to variables
+                import copy
+                loop_vars = copy.deepcopy(all_variables)
+                loop_vars[loop_step.var_name] = item
+                loop_vars["loop_index"] = idx
+                
+                # Also expand nested item properties for template access (e.g., {{item.title}})
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        loop_vars[f"{loop_step.var_name}.{key}"] = value
+                
+                # Execute all steps sequentially within this iteration
+                iteration_output = previous_output
+                for step_idx, step in enumerate(steps_to_run):
+                    step_result = self._execute_single_step_internal(
+                        step, iteration_output, input, loop_vars, model, verbose, step_idx, stream=stream, depth=depth+1
+                    )
+                    iteration_output = step_result.get("output")
+                    # Update variables if step set any
+                    if step_result.get("variables"):
+                        loop_vars.update(step_result["variables"])
+                
+                results.append({"step": f"loop_{idx}", "output": iteration_output})
+                outputs.append(iteration_output)
+                previous_output = iteration_output
+        # Store outputs in user-specified variable or default to loop_outputs
+        output_var_name = loop_step.output_variable or "loop_outputs"
+        all_variables[output_var_name] = outputs
+        all_variables["loop_outputs"] = outputs  # Also keep for backward compatibility
         combined_output = "\n".join(str(o) for o in outputs) if outputs else ""
         
+        # Validate outputs and warn about issues
+        none_count = sum(1 for o in outputs if o is None)
+        if none_count > 0:
+            logger.warning(f"⚠️  Loop '{output_var_name}': {none_count}/{len(outputs)} outputs are None. "
+                          f"Check if agent returned expected format.")
+            if verbose:
+                print(f"⚠️  WARNING: {none_count}/{len(outputs)} loop outputs are None!")
+        
+        # Check for type consistency
+        if outputs and len(outputs) > 0:
+            expected_type = loop_step.step._output_json if hasattr(loop_step.step, '_output_json') else None
+            if expected_type:
+                expected_schema_type = expected_type.get('type') if isinstance(expected_type, dict) else None
+                for i, o in enumerate(outputs):
+                    if o is None:
+                        continue
+                    actual_type = type(o).__name__
+                    if expected_schema_type == 'object' and not isinstance(o, dict):
+                        logger.warning(f"⚠️  Loop output[{i}]: Expected object/dict, got {actual_type}")
+                        if verbose:
+                            print(f"⚠️  Loop output[{i}]: Expected 'object', received '{actual_type}'")
+                    elif expected_schema_type == 'array' and not isinstance(o, list):
+                        logger.warning(f"⚠️  Loop output[{i}]: Expected array/list, got {actual_type}")
+                        if verbose:
+                            print(f"⚠️  Loop output[{i}]: Expected 'array', received '{actual_type}'")
+        
+        # Debug logging for output_variable
+        if verbose:
+            print(f"📦 Loop stored {len(outputs)} results in variable: '{output_var_name}'")
+        
         return {"steps": results, "output": combined_output, "variables": all_variables}
+    
+    def _parse_list_from_string(self, text: str) -> List[Any]:
+        """
+        Parse a list from a string, handling multiple formats.
+        
+        Supports:
+        1. Pure JSON array: '["a", "b", "c"]'
+        2. JSON array embedded in text: 'Here are topics: ["a", "b", "c"]'
+        3. Newline-separated items (fallback)
+        
+        Args:
+            text: String that may contain a list
+            
+        Returns:
+            List of items, or [text] if no list found
+        """
+        import json
+        import re
+        
+        if not text or not text.strip():
+            return []
+        
+        text = text.strip()
+        
+        # 1. Try direct JSON parse (pure JSON array)
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        
+        # 2. Try to extract JSON array from text using regex
+        # Match JSON arrays like ["item1", "item2"] or ['item1', 'item2']
+        json_array_pattern = r'\[(?:[^\[\]]*(?:"[^"]*"|\'[^\']*\')?[^\[\]]*)*\]'
+        matches = re.findall(json_array_pattern, text)
+        
+        for match in matches:
+            try:
+                # Try parsing as JSON
+                parsed = json.loads(match)
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    return parsed
+            except json.JSONDecodeError:
+                # Try replacing single quotes with double quotes
+                try:
+                    fixed = match.replace("'", '"')
+                    parsed = json.loads(fixed)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        return parsed
+                except json.JSONDecodeError:
+                    continue
+        
+        # 3. Fallback: wrap as single item
+        return [text]
     
     def _execute_repeat(
         self,
@@ -1570,7 +2847,8 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         all_variables: Dict[str, Any],
         model: str,
         verbose: bool,
-        stream: bool = True
+        stream: bool = True,
+        depth: int = 0
     ) -> Dict[str, Any]:
         """Repeat step until condition is met."""
         results = []
@@ -1581,7 +2859,7 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         
         for iteration in range(repeat_step.max_iterations):
             step_result = self._execute_single_step_internal(
-                repeat_step.step, output, input, all_variables, model, verbose, iteration, stream=stream
+                repeat_step.step, output, input, all_variables, model, verbose, iteration, stream=stream, depth=depth+1
             )
             results.append({"step": f"{step_result['step']}_{iteration}", "output": step_result["output"]})
             output = step_result["output"]
@@ -1608,6 +2886,360 @@ Create a brief execution plan (2-3 sentences) describing how to best accomplish 
         
         all_variables["repeat_iterations"] = iteration + 1
         return {"steps": results, "output": output, "variables": all_variables}
+    
+    def _execute_if(
+        self,
+        if_step: If,
+        previous_output: Optional[str],
+        input: str,
+        all_variables: Dict[str, Any],
+        model: str,
+        verbose: bool,
+        stream: bool = True,
+        depth: int = 0
+    ) -> Dict[str, Any]:
+        """Execute conditional branching based on condition evaluation.
+        
+        Args:
+            if_step: The If step with condition and branches
+            previous_output: Output from previous step
+            input: Original workflow input
+            all_variables: Current workflow variables
+            model: LLM model to use
+            verbose: Verbose output
+            stream: Enable streaming
+            depth: Current nesting depth
+            
+        Returns:
+            Dict with 'steps', 'output', and 'variables'
+        """
+        results = []
+        output = previous_output
+        
+        # Evaluate the condition
+        condition_result = self._evaluate_condition(if_step.condition, all_variables, previous_output)
+        
+        if verbose:
+            branch = "then" if condition_result else "else"
+            print(f"🔀 Condition '{if_step.condition}' → {condition_result}, executing {branch} branch")
+        
+        # Select the appropriate branch
+        steps_to_execute = if_step.then_steps if condition_result else if_step.else_steps
+        
+        # Execute the selected branch
+        for idx, step in enumerate(steps_to_execute):
+            step_result = self._execute_single_step_internal(
+                step, output, input, all_variables, model, verbose, idx, stream=stream, depth=depth
+            )
+            results.append({"step": step_result["step"], "output": step_result["output"]})
+            output = step_result["output"]
+            all_variables.update(step_result.get("variables", {}))
+            
+            if step_result.get("stop"):
+                break
+        
+        return {"steps": results, "output": output, "variables": all_variables}
+    
+    def _evaluate_condition(
+        self,
+        condition: str,
+        variables: Dict[str, Any],
+        previous_output: Optional[str] = None
+    ) -> bool:
+        """Evaluate a condition expression with variable substitution.
+        
+        Supported formats:
+            - Numeric comparison: "{{var}} > 80", "{{var}} >= 50", "{{var}} < 10"
+            - String equality: "{{var}} == approved", "{{var}} != rejected"
+            - Contains check: "error in {{message}}", "{{status}} contains success"
+            - Boolean: "{{flag}}" (truthy check)
+            - Nested property: "{{item.score}} >= 60"
+        
+        Args:
+            condition: Condition expression with {{var}} placeholders
+            variables: Current workflow variables
+            previous_output: Output from previous step
+            
+        Returns:
+            Boolean result of condition evaluation
+        """
+        import re
+        
+        # Substitute variables in condition
+        substituted = condition
+        
+        # Handle nested property access like {{item.score}}
+        def get_nested_value(var_path: str, vars_dict: Dict[str, Any]) -> Any:
+            parts = var_path.split('.')
+            value = vars_dict
+            for part in parts:
+                if isinstance(value, dict):
+                    value = value.get(part)
+                else:
+                    return None
+            return value
+        
+        # Find all {{var}} patterns and substitute
+        pattern = r'\{\{([^}]+)\}\}'
+        matches = re.findall(pattern, condition)
+        
+        for var_name in matches:
+            if '.' in var_name:
+                # Nested property access
+                value = get_nested_value(var_name, variables)
+            else:
+                value = variables.get(var_name)
+            
+            if value is None:
+                value = ""
+            
+            # Replace the placeholder with the value
+            placeholder = f"{{{{{var_name}}}}}"
+            if isinstance(value, (int, float)):
+                substituted = substituted.replace(placeholder, str(value))
+            elif isinstance(value, bool):
+                substituted = substituted.replace(placeholder, str(value).lower())
+            else:
+                substituted = substituted.replace(placeholder, str(value))
+        
+        # Also substitute {{previous_output}}
+        if previous_output:
+            substituted = substituted.replace("{{previous_output}}", str(previous_output))
+        
+        # Now evaluate the substituted condition
+        try:
+            # Handle different condition formats
+            
+            # Numeric comparisons: "90 > 80", "50 >= 50", "10 < 20", etc.
+            numeric_pattern = r'^(-?\d+(?:\.\d+)?)\s*(>|>=|<|<=|==|!=)\s*(-?\d+(?:\.\d+)?)$'
+            numeric_match = re.match(numeric_pattern, substituted.strip())
+            if numeric_match:
+                left = float(numeric_match.group(1))
+                op = numeric_match.group(2)
+                right = float(numeric_match.group(3))
+                
+                if op == '>':
+                    return left > right
+                if op == '>=':
+                    return left >= right
+                if op == '<':
+                    return left < right
+                if op == '<=':
+                    return left <= right
+                if op == '==':
+                    return left == right
+                if op == '!=':
+                    return left != right
+            
+            # String equality: "approved == approved", "status != rejected"
+            string_eq_pattern = r'^(.+?)\s*(==|!=)\s*(.+)$'
+            string_match = re.match(string_eq_pattern, substituted.strip())
+            if string_match:
+                left = string_match.group(1).strip()
+                op = string_match.group(2)
+                right = string_match.group(3).strip()
+                
+                if op == '==':
+                    return left == right
+                if op == '!=':
+                    return left != right
+            
+            # Contains check: "error in some message", "status contains success"
+            if ' in ' in substituted:
+                parts = substituted.split(' in ', 1)
+                if len(parts) == 2:
+                    needle = parts[0].strip()
+                    haystack = parts[1].strip()
+                    return needle.lower() in haystack.lower()
+            
+            if ' contains ' in substituted:
+                parts = substituted.split(' contains ', 1)
+                if len(parts) == 2:
+                    haystack = parts[0].strip()
+                    needle = parts[1].strip()
+                    return needle.lower() in haystack.lower()
+            
+            # Boolean check: truthy evaluation
+            # Handle "true", "false", "True", "False"
+            if substituted.strip().lower() == 'true':
+                return True
+            if substituted.strip().lower() == 'false':
+                return False
+            
+            # Non-empty string is truthy
+            return bool(substituted.strip())
+            
+        except Exception as e:
+            logger.warning(f"Condition evaluation failed for '{condition}': {e}")
+            return False
+    
+    def _execute_include(
+        self,
+        include_step: Include,
+        previous_output: Optional[str],
+        input: str,
+        all_variables: Dict[str, Any],
+        model: str,
+        verbose: bool,
+        stream: bool = True,
+        visited_recipes: Optional[set] = None
+    ) -> Dict[str, Any]:
+        """Execute an included recipe as a workflow step.
+        
+        Args:
+            include_step: The Include step with recipe name
+            previous_output: Output from previous step
+            input: Original workflow input
+            all_variables: Current workflow variables
+            model: LLM model to use
+            verbose: Verbose output
+            stream: Enable streaming
+            visited_recipes: Set of already-visited recipe names (for cycle detection)
+            
+        Returns:
+            Dict with 'steps', 'output', and 'variables'
+        """
+        recipe_name = include_step.recipe
+        
+        # Cycle detection
+        if visited_recipes is None:
+            visited_recipes = set()
+        
+        if recipe_name in visited_recipes:
+            error_msg = f"Circular include detected: {recipe_name} was already included in this execution chain"
+            logger.error(error_msg)
+            return {
+                "steps": [{"step": f"include:{recipe_name}", "output": f"Error: {error_msg}"}],
+                "output": error_msg,
+                "variables": all_variables
+            }
+        
+        visited_recipes.add(recipe_name)
+        
+        if verbose:
+            print(f"📦 Including recipe: {recipe_name}")
+        
+        try:
+            # Try to resolve recipe path using agent_recipes if available
+            recipe_path = None
+            
+            try:
+                from agent_recipes import get_template_path
+                recipe_path = get_template_path(recipe_name)
+            except ImportError:
+                # agent_recipes not installed, try local path
+                from pathlib import Path
+                if Path(recipe_name).exists():
+                    recipe_path = Path(recipe_name)
+                else:
+                    # Try as relative path to current working directory
+                    import os
+                    cwd = Path(os.getcwd())
+                    potential_path = cwd / recipe_name
+                    if potential_path.exists():
+                        recipe_path = potential_path
+            
+            if not recipe_path:
+                error_msg = f"Recipe not found: {recipe_name}"
+                logger.error(error_msg)
+                return {
+                    "steps": [{"step": f"include:{recipe_name}", "output": f"Error: {error_msg}"}],
+                    "output": error_msg,
+                    "variables": all_variables
+                }
+            
+            # Find the YAML file (agents.yaml or workflow.yaml)
+            recipe_yaml = None
+            from pathlib import Path
+            recipe_path = Path(recipe_path)
+            
+            for yaml_name in ["agents.yaml", "workflow.yaml", "TEMPLATE.yaml"]:
+                yaml_path = recipe_path / yaml_name
+                if yaml_path.exists():
+                    recipe_yaml = yaml_path
+                    break
+            
+            if not recipe_yaml:
+                error_msg = f"No workflow YAML found in {recipe_path}"
+                logger.error(error_msg)
+                return {
+                    "steps": [{"step": f"include:{recipe_name}", "output": f"Error: {error_msg}"}],
+                    "output": error_msg,
+                    "variables": all_variables
+                }
+            
+            # Load tools from the recipe's tools.py if present
+            tool_registry = {}
+            tools_py = recipe_path / "tools.py"
+            if tools_py.exists():
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("recipe_tools", tools_py)
+                    recipe_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(recipe_module)
+                    
+                    # Extract callable tools
+                    for name in dir(recipe_module):
+                        if not name.startswith("_"):
+                            obj = getattr(recipe_module, name)
+                            if callable(obj):
+                                tool_registry[name] = obj
+                except Exception as e:
+                    logger.warning(f"Failed to load tools from {tools_py}: {e}")
+            
+            # Determine input for the included recipe
+            recipe_input = include_step.input or previous_output or input
+            
+            # Convert non-string inputs to JSON string for variable substitution
+            if recipe_input and not isinstance(recipe_input, str):
+                recipe_input = json.dumps(recipe_input)
+            
+            # Substitute variables in the input (only if it's a string)
+            if recipe_input and isinstance(recipe_input, str):
+                for key, value in all_variables.items():
+                    recipe_input = recipe_input.replace(f"{{{{{key}}}}}", str(value))
+                if previous_output:
+                    prev_str = previous_output if isinstance(previous_output, str) else json.dumps(previous_output)
+                    recipe_input = recipe_input.replace("{{previous_output}}", prev_str)
+                recipe_input = recipe_input.replace("{{input}}", input)
+            
+            # Parse and execute the included workflow
+            from .yaml_parser import YAMLWorkflowParser
+            parser = YAMLWorkflowParser(tool_registry=tool_registry)
+            included_workflow = parser.parse_file(str(recipe_yaml))
+            
+            # Merge parent variables into included workflow
+            included_workflow.variables.update(all_variables)
+            included_workflow.variables["previous_output"] = previous_output
+            
+            # Execute the included workflow
+            result = included_workflow.run(
+                input=recipe_input or "",
+                llm=model,
+                verbose=verbose,
+                stream=stream
+            )
+            
+            if verbose:
+                print(f"✅ Included recipe {recipe_name} completed")
+            
+            # Return result in expected format
+            return {
+                "steps": result.get("steps", []),
+                "output": result.get("output", ""),
+                "variables": {**all_variables, **result.get("variables", {})}
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to execute included recipe {recipe_name}: {e}")
+            return {
+                "steps": [{"step": f"include:{recipe_name}", "output": f"Error: {e}"}],
+                "output": f"Error executing {recipe_name}: {e}",
+                "variables": all_variables
+            }
+        finally:
+            # Remove from visited after execution completes (allow re-use in different branches)
+            visited_recipes.discard(recipe_name)
     
     def start(self, input: str = "", **kwargs) -> Dict[str, Any]:
         """Alias for run() for consistency with Agents."""
@@ -2082,12 +3714,18 @@ class WorkflowManager:
         text: str,
         variables: Dict[str, Any]
     ) -> str:
-        """Substitute {{variable}} placeholders in text."""
-        def replace(match):
-            var_name = match.group(1).strip()
-            return str(variables.get(var_name, match.group(0)))
+        """
+        Substitute {{variable}} placeholders in text.
         
-        return re.sub(r'\{\{(\w+)\}\}', replace, text)
+        Delegates to shared substitute_variables() utility for DRY compliance.
+        
+        Resolution order:
+        1. Dynamic variable providers ({{now}}, {{today}}, {{uuid}}, etc.)
+        2. Static variables from workflow variables dict
+        3. Keep original placeholder if not found
+        """
+        from praisonaiagents.utils.variables import substitute_variables
+        return substitute_variables(text, variables)
     
     def _build_step_context(
         self,

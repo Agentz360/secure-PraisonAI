@@ -45,6 +45,44 @@ def __getattr__(name):
     elif name == "python_type_to_json_schema":
         from .mcp_utils import python_type_to_json_schema
         return python_type_to_json_schema
+    elif name == "fix_array_schemas":
+        from .mcp_schema_utils import fix_array_schemas
+        return fix_array_schemas
+    elif name == "ThreadLocalEventLoop":
+        from .mcp_schema_utils import ThreadLocalEventLoop
+        return ThreadLocalEventLoop
+    elif name == "get_thread_local_event_loop":
+        from .mcp_schema_utils import get_thread_local_event_loop
+        return get_thread_local_event_loop
+    # Auth storage (lazy loaded)
+    elif name == "MCPAuthStorage":
+        from .mcp_auth_storage import MCPAuthStorage
+        return MCPAuthStorage
+    elif name == "get_default_auth_filepath":
+        from .mcp_auth_storage import get_default_auth_filepath
+        return get_default_auth_filepath
+    # OAuth callback utilities (lazy loaded)
+    elif name == "OAuthCallbackHandler":
+        from .mcp_oauth_callback import OAuthCallbackHandler
+        return OAuthCallbackHandler
+    elif name == "generate_state":
+        from .mcp_oauth_callback import generate_state
+        return generate_state
+    elif name == "generate_code_verifier":
+        from .mcp_oauth_callback import generate_code_verifier
+        return generate_code_verifier
+    elif name == "generate_code_challenge":
+        from .mcp_oauth_callback import generate_code_challenge
+        return generate_code_challenge
+    elif name == "get_redirect_url":
+        from .mcp_oauth_callback import get_redirect_url
+        return get_redirect_url
+    elif name == "OAUTH_CALLBACK_PORT":
+        from .mcp_oauth_callback import OAUTH_CALLBACK_PORT
+        return OAUTH_CALLBACK_PORT
+    elif name == "OAUTH_CALLBACK_PATH":
+        from .mcp_oauth_callback import OAUTH_CALLBACK_PATH
+        return OAUTH_CALLBACK_PATH
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
@@ -57,10 +95,25 @@ __all__ = [
     "function_to_mcp_schema",
     "get_tool_metadata",
     "python_type_to_json_schema",
+    # Schema utilities (lazy loaded)
+    "fix_array_schemas",
+    "ThreadLocalEventLoop",
+    "get_thread_local_event_loop",
     # Transport components (lazy loaded)
     "WebSocketMCPClient",
     "SessionManager",
     "SecurityConfig",
     "BaseTransport",
     "TransportConfig",
+    # Auth storage (lazy loaded)
+    "MCPAuthStorage",
+    "get_default_auth_filepath",
+    # OAuth callback utilities (lazy loaded)
+    "OAuthCallbackHandler",
+    "generate_state",
+    "generate_code_verifier",
+    "generate_code_challenge",
+    "get_redirect_url",
+    "OAUTH_CALLBACK_PORT",
+    "OAUTH_CALLBACK_PATH",
 ]

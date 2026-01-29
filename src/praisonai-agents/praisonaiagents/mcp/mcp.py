@@ -162,7 +162,7 @@ class MCP:
         # Method 1: Using command and args separately
         agent = Agent(
             instructions="You are a helpful assistant...",
-            llm="gpt-5-nano",
+            llm="gpt-4o-mini",
             tools=MCP(
                 command="/path/to/python",
                 args=["/path/to/app.py"]
@@ -172,14 +172,14 @@ class MCP:
         # Method 2: Using a single command string
         agent = Agent(
             instructions="You are a helpful assistant...",
-            llm="gpt-5-nano",
+            llm="gpt-4o-mini",
             tools=MCP("/path/to/python /path/to/app.py")
         )
         
         # Method 3: Using an SSE endpoint
         agent = Agent(
             instructions="You are a helpful assistant...",
-            llm="gpt-5-nano",
+            llm="gpt-4o-mini",
             tools=MCP("http://localhost:8080/sse")
         )
         
@@ -507,6 +507,26 @@ class MCP:
         """
         return iter(self._tools)
     
+    def get_tools(self) -> List[Callable]:
+        """
+        Get the list of tool functions from this MCP instance.
+        
+        This method provides explicit access to the tools list, which is useful
+        when you need to inspect or manipulate the tools programmatically.
+        
+        Returns:
+            List[Callable]: List of tool functions that can be called
+            
+        Example:
+            ```python
+            mcp = MCP("npx -y @modelcontextprotocol/server-time")
+            tools = mcp.get_tools()
+            for tool in tools:
+                print(f"Tool: {tool.__name__}")
+            ```
+        """
+        return self._tools
+    
     def _fix_array_schemas(self, schema):
         """
         Fix array schemas by adding missing 'items' attribute required by OpenAI.
@@ -548,7 +568,7 @@ class MCP:
         """Convert the MCP tool to an OpenAI-compatible tool definition.
         
         This method is specifically invoked by the Agent class when using
-        provider/model format (e.g., "openai/gpt-5-nano").
+        provider/model format (e.g., "openai/gpt-4o-mini").
         
         Returns:
             dict or list: OpenAI-compatible tool definition(s)

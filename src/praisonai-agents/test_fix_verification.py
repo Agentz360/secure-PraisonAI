@@ -24,8 +24,8 @@ test_agent = Agent(
     role="Test Agent",
     goal="Test the fix",
     tools=[simple_tool],
-    llm="gpt-5-nano",  # Using OpenAI for testing
-    verbose=False  # This is key - verbose=False triggers the bug
+    llm="gpt-4o-mini",  # Using OpenAI for testing
+    output="silent"  # This is key - output="silent" triggers the bug
 )
 
 # Simple task
@@ -44,7 +44,7 @@ async def main():
         agents=[test_agent],
         tasks=[test_task],
         process="sequential",
-        verbose=False  # This should not cause the error anymore
+        output="silent"  # This should not cause the error anymore
     )
     
     try:
