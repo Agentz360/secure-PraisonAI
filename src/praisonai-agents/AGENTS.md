@@ -21,7 +21,9 @@ Simpler than competitors • More extensible • Faster • Agent-centric
 | **Minimal API** | Fewer parameters, sensible defaults, explicit overrides |
 | **Performance-First** | Lazy loading, optional dependencies, no hot-path regressions |
 | **Production-Ready** | Safe by default, multi-agent safe, async-safe |
-
+Powerful, lightweight, highly reliable and robust
+Easy and developer frienldy for non developers
+Easy and user friendly
 ---
 
 ## 2. Repository Structure
@@ -371,6 +373,9 @@ class MyTool(BaseTool):
 - `praisonaiagents/tools/base.py` - BaseTool class
 - `praisonaiagents/tools/decorator.py` - @tool decorator
 - `praisonaiagents/tools/registry.py` - Tool registry
+
+> [!IMPORTANT]
+> **Agents only recognize parameters.** When creating tools, always expose all options as function parameters—agents cannot discover env vars or config files.
 
 ### 6.2 Hooks & Middleware
 

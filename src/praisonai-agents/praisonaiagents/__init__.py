@@ -222,8 +222,9 @@ _LAZY_IMPORTS = {
     'CodeAgent': ('praisonaiagents.agent.code_agent', 'CodeAgent'),
     'CodeConfig': ('praisonaiagents.agent.code_agent', 'CodeConfig'),
     
-    # Agents
-    'Agents': ('praisonaiagents.agents.agents', 'Agents'),
+    # Agents / AgentManager
+    'AgentManager': ('praisonaiagents.agents.agents', 'AgentManager'),
+    # Note: 'Agents' is handled by _custom_handler for deprecation warning
     'Task': ('praisonaiagents.task.task', 'Task'),
     'AutoAgents': ('praisonaiagents.agents.autoagents', 'AutoAgents'),
     'AutoRagAgent': ('praisonaiagents.agents.auto_rag_agent', 'AutoRagAgent'),
@@ -232,6 +233,10 @@ _LAZY_IMPORTS = {
     
     # Session
     'Session': ('praisonaiagents.session', 'Session'),
+    
+    # App (AgentApp protocol and config)
+    'AgentAppProtocol': ('praisonaiagents.app.protocols', 'AgentAppProtocol'),
+    'AgentAppConfig': ('praisonaiagents.app.config', 'AgentAppConfig'),
     
     # MCP (optional)
     'MCP': ('praisonaiagents.mcp.mcp', 'MCP'),
@@ -381,6 +386,38 @@ _LAZY_IMPORTS = {
     # db and obs modules
     'db': ('praisonaiagents.db', 'db'),
     'obs': ('praisonaiagents.obs', 'obs'),
+    
+    # Gateway protocols and config (implementations in praisonai wrapper)
+    'GatewayProtocol': ('praisonaiagents.gateway.protocols', 'GatewayProtocol'),
+    'GatewaySessionProtocol': ('praisonaiagents.gateway.protocols', 'GatewaySessionProtocol'),
+    'GatewayClientProtocol': ('praisonaiagents.gateway.protocols', 'GatewayClientProtocol'),
+    'GatewayEvent': ('praisonaiagents.gateway.protocols', 'GatewayEvent'),
+    'GatewayMessage': ('praisonaiagents.gateway.protocols', 'GatewayMessage'),
+    'EventType': ('praisonaiagents.gateway.protocols', 'EventType'),
+    'GatewayConfig': ('praisonaiagents.gateway.config', 'GatewayConfig'),
+    'SessionConfig': ('praisonaiagents.gateway.config', 'SessionConfig'),
+    
+    # Bot protocols and config (implementations in praisonai wrapper)
+    'BotProtocol': ('praisonaiagents.bots.protocols', 'BotProtocol'),
+    'BotMessage': ('praisonaiagents.bots.protocols', 'BotMessage'),
+    'BotUser': ('praisonaiagents.bots.protocols', 'BotUser'),
+    'BotChannel': ('praisonaiagents.bots.protocols', 'BotChannel'),
+    'MessageType': ('praisonaiagents.bots.protocols', 'MessageType'),
+    'BotConfig': ('praisonaiagents.bots.config', 'BotConfig'),
+    
+    # Sandbox protocols and config (implementations in praisonai wrapper)
+    'SandboxProtocol': ('praisonaiagents.sandbox.protocols', 'SandboxProtocol'),
+    'SandboxResult': ('praisonaiagents.sandbox.protocols', 'SandboxResult'),
+    'SandboxStatus': ('praisonaiagents.sandbox.protocols', 'SandboxStatus'),
+    'ResourceLimits': ('praisonaiagents.sandbox.protocols', 'ResourceLimits'),
+    'SandboxConfig': ('praisonaiagents.sandbox.config', 'SandboxConfig'),
+    'SecurityPolicy': ('praisonaiagents.sandbox.config', 'SecurityPolicy'),
+    
+    # Model failover
+    'AuthProfile': ('praisonaiagents.llm.failover', 'AuthProfile'),
+    'ProviderStatus': ('praisonaiagents.llm.failover', 'ProviderStatus'),
+    'FailoverConfig': ('praisonaiagents.llm.failover', 'FailoverConfig'),
+    'FailoverManager': ('praisonaiagents.llm.failover', 'FailoverManager'),
 }
 
 
@@ -388,17 +425,44 @@ def _custom_handler(name, cache):
     """Handle special cases that need custom logic."""
     import warnings
     
-    # PraisonAIAgents deprecation warning
-    if name == "PraisonAIAgents":
+    # Agents deprecation warning (use AgentManager instead)
+    if name == "Agents":
         warnings.warn(
-            "PraisonAIAgents is deprecated, use Agents instead. "
-            "Example: from praisonaiagents import Agents",
+            "Agents is deprecated, use AgentManager instead. "
+            "Example: from praisonaiagents import AgentManager",
             DeprecationWarning,
             stacklevel=4
         )
-        value = lazy_import('praisonaiagents.agents.agents', 'Agents', cache)
+        value = lazy_import('praisonaiagents.agents.agents', 'AgentManager', cache)
+        cache['AgentManager'] = value
         cache['Agents'] = value
+        return value
+    
+    # PraisonAIAgents deprecation warning (use AgentManager instead)
+    if name == "PraisonAIAgents":
+        warnings.warn(
+            "PraisonAIAgents is deprecated, use AgentManager instead. "
+            "Example: from praisonaiagents import AgentManager",
+            DeprecationWarning,
+            stacklevel=4
+        )
+        value = lazy_import('praisonaiagents.agents.agents', 'AgentManager', cache)
+        cache['AgentManager'] = value
         cache['PraisonAIAgents'] = value
+        return value
+    
+    # WorkflowStep deprecation warning (use Task instead) - Phase 4 Consolidation
+    if name == "WorkflowStep":
+        warnings.warn(
+            "WorkflowStep is deprecated, use Task instead. "
+            "Task now supports all WorkflowStep features including action, handler, loop_over, etc. "
+            "Example: from praisonaiagents import Task",
+            DeprecationWarning,
+            stacklevel=4
+        )
+        value = lazy_import('praisonaiagents.task.task', 'Task', cache)
+        cache['Task'] = value
+        cache['WorkflowStep'] = value
         return value
     
     # Module imports (return the module itself)
@@ -535,7 +599,8 @@ def warmup(include_litellm: bool = False, include_openai: bool = True) -> dict:
 __all__ = [
     # Core classes - the essentials
     'Agent',
-    'Agents',
+    'AgentManager',  # Primary class for multi-agent coordination (v0.14.16+)
+    'Agents',  # Deprecated alias for AgentManager
     'Task',
     
     # Tool essentials

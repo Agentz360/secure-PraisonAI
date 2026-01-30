@@ -217,6 +217,13 @@ def register_commands():
     from .commands.examples import app as examples_app
     from .commands.batch import app as batch_app
     from .commands.replay import app as replay_app
+    from .commands.loop import app as loop_app
+    
+    # Import new moltbot-inspired commands
+    from .commands.bot import app as bot_app
+    from .commands.browser import app as browser_app
+    from .commands.plugins import app as plugins_app
+    from .commands.sandbox import app as sandbox_app
     
     # Import TUI and queue commands
     from .features.tui.debug import create_debug_app as create_tui_debug_app
@@ -276,6 +283,119 @@ def register_commands():
     app.add_typer(examples_app, name="examples", help="Run and manage example files")
     app.add_typer(batch_app, name="batch", help="Run all PraisonAI scripts in current folder")
     app.add_typer(replay_app, name="replay", help="Context replay for debugging agent execution")
+    app.add_typer(loop_app, name="loop", help="Autonomous agent execution loops")
+    
+    # Helper function for loading agents from config
+    def _load_agents_from_config_file(config_path: str, console) -> list:
+        """Load agents from a YAML config file."""
+        import yaml
+        
+        try:
+            with open(config_path, 'r') as f:
+                config_data = yaml.safe_load(f)
+        except Exception as e:
+            console.print(f"[red]Error loading config: {e}[/red]")
+            return []
+        
+        if not config_data:
+            return []
+        
+        agents = []
+        
+        # Try to load agents from config
+        agents_config = config_data.get('agents', [])
+        if not agents_config and 'agent' in config_data:
+            agents_config = [config_data['agent']]
+        
+        if agents_config:
+            try:
+                from praisonaiagents import Agent
+                
+                for agent_data in agents_config:
+                    if isinstance(agent_data, dict):
+                        agent = Agent(
+                            name=agent_data.get('name', 'Agent'),
+                            role=agent_data.get('role'),
+                            instructions=agent_data.get('instructions', agent_data.get('goal', '')),
+                            llm=agent_data.get('llm'),
+                        )
+                        agents.append(agent)
+                        console.print(f"[green]✓ Loaded agent: {agent.name}[/green]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not load agents from config: {e}[/yellow]")
+        
+        return agents
+    
+    # Register app command directly using Typer
+    @app.command(name="app")
+    def app_cmd(
+        port: int = typer.Option(8000, "--port", "-p", help="Port to listen on"),
+        host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host to bind to"),
+        config: str = typer.Option(None, "--config", "-c", help="Path to config file (YAML)"),
+        reload: bool = typer.Option(False, "--reload", "-r", help="Enable auto-reload for development"),
+        debug: bool = typer.Option(False, "--debug", "-d", help="Enable debug mode"),
+        name: str = typer.Option("PraisonAI App", "--name", "-n", help="Application name"),
+    ):
+        """
+        Start an AgentApp server for production deployment.
+        
+        AgentApp provides a FastAPI-based web service for deploying AI agents
+        with REST and WebSocket endpoints.
+        """
+        from rich.console import Console
+        console = Console()
+        
+        try:
+            from praisonai import AgentApp
+            from praisonaiagents import AgentAppConfig
+        except ImportError as e:
+            console.print(f"[red]Error importing AgentApp: {e}[/red]")
+            console.print("[yellow]Install with: pip install praisonai[api][/yellow]")
+            raise typer.Abort()
+        
+        # Load agents from config file if provided
+        agents = []
+        if config:
+            agents = _load_agents_from_config_file(config, console)
+        
+        # Create config
+        app_config = AgentAppConfig(
+            name=name,
+            host=host,
+            port=port,
+            reload=reload,
+            debug=debug,
+        )
+        
+        # Create and start app
+        console.print(f"\n[bold green]🚀 Starting {name}[/bold green]")
+        console.print(f"[dim]Host: {host}:{port}[/dim]")
+        if agents:
+            console.print(f"[dim]Agents: {len(agents)}[/dim]")
+        if reload:
+            console.print("[yellow]Auto-reload enabled (development mode)[/yellow]")
+        console.print()
+        
+        try:
+            agent_app = AgentApp(
+                name=name,
+                agents=agents,
+                config=app_config,
+            )
+            agent_app.serve()
+        except ImportError as e:
+            console.print(f"[red]Missing dependency: {e}[/red]")
+            console.print("[yellow]Install with: pip install praisonai[api][/yellow]")
+            raise typer.Abort()
+        except Exception as e:
+            console.print(f"[red]Error starting server: {e}[/red]")
+            raise typer.Abort()
+    
+    # Register moltbot-inspired commands
+    app.add_typer(bot_app, name="bot", help="Messaging bots with full agent capabilities")
+    app.add_typer(browser_app, name="browser", help="Browser control for agent automation")
+    app.add_typer(plugins_app, name="plugins", help="Plugin management and inspection")
+    app.add_typer(sandbox_app, name="sandbox", help="Sandbox container management")
     
     # Register standardise command
     try:
