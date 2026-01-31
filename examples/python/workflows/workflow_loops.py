@@ -5,24 +5,24 @@ Demonstrates iterating over a list of items in a workflow step.
 Each item is processed individually with the loop variable.
 """
 
-from praisonaiagents import Workflow, WorkflowStep
-from praisonaiagents.workflows import WorkflowManager
+from praisonaiagents import AgentFlow, Task
+from praisonaiagents import AgentFlowManager
 
 # Create a workflow with loop
-workflow = Workflow(
+workflow = AgentFlow(
     name="Process Items",
     description="Process a list of items using loop",
     variables={
         "items": ["apple", "banana", "cherry"]  # List to iterate over
     },
     steps=[
-        WorkflowStep(
+        Task(
             name="process_each",
             action="Describe the fruit: {{item}}",
             loop_over="items",  # Variable name containing the list
             loop_var="item"     # Variable name for current item
         ),
-        WorkflowStep(
+        Task(
             name="summarize",
             action="Summarize all the fruits that were processed."
         )

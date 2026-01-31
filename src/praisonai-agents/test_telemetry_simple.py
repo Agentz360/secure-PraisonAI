@@ -3,13 +3,13 @@
 Simple test to check telemetry.
 """
 
-from praisonaiagents import Agent, Task, Agents
+from praisonaiagents import Agent, Task, AgentTeam
 from praisonaiagents.telemetry import get_telemetry
 
 # Create workflow
 agent = Agent(name="Test", role="Tester", goal="Test", instructions="Test")
 task = Task(description="Test", expected_output="Test", agent=agent)
-workflow = Agents(agents=[agent], tasks=[task], process="sequential")
+workflow = AgentTeam(agents=[agent], tasks=[task], process="sequential")
 
 # Run workflow
 print("Running workflow...")

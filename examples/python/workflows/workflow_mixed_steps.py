@@ -4,10 +4,10 @@ Mixed Steps Workflow Example
 Demonstrates combining different step types in a single workflow:
 - Agent instances
 - Handler functions
-- WorkflowStep with action strings
+- Task with action strings
 """
 
-from praisonaiagents import Workflow, WorkflowStep, WorkflowContext, StepResult, Agent
+from praisonaiagents import AgentFlow, Task, WorkflowContext, StepResult, Agent
 
 # Create an agent
 analyzer = Agent(
@@ -35,7 +35,7 @@ def format_output(ctx: WorkflowContext) -> StepResult:
     )
 
 # Create workflow with mixed step types
-workflow = Workflow(
+workflow = AgentFlow(
     name="Mixed Pipeline",
     steps=[
         # Step 1: Function - validates input
@@ -44,8 +44,8 @@ workflow = Workflow(
         # Step 2: Agent - analyzes content
         analyzer,
         
-        # Step 3: WorkflowStep with action string
-        WorkflowStep(
+        # Step 3: Task with action string
+        Task(
             name="enhance",
             action="Add a conclusion to this analysis: {{previous_output}}"
         ),

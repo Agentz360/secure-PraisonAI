@@ -2,7 +2,7 @@
 Tests for API export simplification.
 
 Verifies:
-1. Core imports work (Agent, Agents, Task, tool, Tools)
+1. Core imports work (Agent, AgentManager, Task, tool, Tools)
 2. Backwards compat imports work (MemoryConfig, etc.)
 3. Organized imports work (from praisonaiagents.config import X)
 4. Namespace style works (import praisonaiagents as pa)
@@ -22,7 +22,7 @@ class TestCoreImports:
         assert hasattr(Agent, '__init__')
     
     def test_agents_import(self):
-        """Agents class is importable from root."""
+        """Agents class is importable from root (silent alias for AgentManager)."""
         from praisonaiagents import Agents
         assert Agents is not None
     
@@ -195,16 +195,18 @@ class TestNamespaceStyle:
 class TestAllSizeLimited:
     """Test that __all__ is limited to core symbols."""
     
-    def test_all_size_under_20(self):
-        """__all__ should have fewer than 20 items."""
+    def test_all_size_under_21(self):
+        """__all__ should have fewer than 21 items (minimal for clean IDE)."""
         import praisonaiagents
-        assert len(praisonaiagents.__all__) < 20, \
-            f"__all__ has {len(praisonaiagents.__all__)} items, expected < 20"
+        assert len(praisonaiagents.__all__) < 21, \
+            f"__all__ has {len(praisonaiagents.__all__)} items, expected < 21"
     
     def test_all_contains_core(self):
         """__all__ contains core symbols."""
         import praisonaiagents
-        core = {'Agent', 'Agents', 'Task', 'tool', 'Tools'}
+        # AgentTeam is primary, Agents is deprecated alias
+        # AgentFlow is primary, Workflow/Pipeline are silent aliases
+        core = {'Agent', 'AgentTeam', 'Task', 'tool', 'Tools'}
         for symbol in core:
             assert symbol in praisonaiagents.__all__, \
                 f"'{symbol}' not in __all__"

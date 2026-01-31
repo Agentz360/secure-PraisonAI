@@ -76,7 +76,7 @@ from . import tools
 # Supports: embedding, embeddings, aembedding, aembeddings, EmbeddingResult, get_dimensions
 
 # Workflows - LAZY LOADED (moved to __getattr__)
-# Workflow, WorkflowStep, WorkflowContext, StepResult, Route, Parallel, Loop, Repeat, etc.
+# Workflow, Task, WorkflowContext, StepResult, Route, Parallel, Loop, Repeat, etc.
 
 # Guardrails - LAZY LOADED (imports main.py which imports rich)
 # GuardrailResult and LLMGuardrail moved to __getattr__
@@ -140,9 +140,10 @@ _LAZY_IMPORTS = {
     'sync_display_callbacks': ('praisonaiagents.main', 'sync_display_callbacks'),
     'async_display_callbacks': ('praisonaiagents.main', 'async_display_callbacks'),
     
-    # Workflows
-    'Workflow': ('praisonaiagents.workflows', 'Workflow'),
-    'WorkflowStep': ('praisonaiagents.workflows', 'WorkflowStep'),
+    # AgentFlow (primary) / Workflow (alias)
+    'AgentFlow': ('praisonaiagents.workflows', 'AgentFlow'),
+    'Workflow': ('praisonaiagents.workflows', 'Workflow'),  # Silent alias
+    'Pipeline': ('praisonaiagents.workflows', 'Pipeline'),  # Silent alias
     'WorkflowContext': ('praisonaiagents.workflows', 'WorkflowContext'),
     'StepResult': ('praisonaiagents.workflows', 'StepResult'),
     'Route': ('praisonaiagents.workflows', 'Route'),
@@ -153,7 +154,6 @@ _LAZY_IMPORTS = {
     'parallel': ('praisonaiagents.workflows', 'parallel'),
     'loop': ('praisonaiagents.workflows', 'loop'),
     'repeat': ('praisonaiagents.workflows', 'repeat'),
-    'Pipeline': ('praisonaiagents.workflows', 'Pipeline'),
     
     # Handoff
     'Handoff': ('praisonaiagents.agent.handoff', 'Handoff'),
@@ -222,8 +222,9 @@ _LAZY_IMPORTS = {
     'CodeAgent': ('praisonaiagents.agent.code_agent', 'CodeAgent'),
     'CodeConfig': ('praisonaiagents.agent.code_agent', 'CodeConfig'),
     
-    # Agents / AgentManager
-    'AgentManager': ('praisonaiagents.agents.agents', 'AgentManager'),
+    # AgentTeam (primary) / AgentManager (alias)
+    'AgentTeam': ('praisonaiagents.agents.agents', 'AgentTeam'),
+    'AgentManager': ('praisonaiagents.agents.agents', 'AgentManager'),  # Silent alias
     # Note: 'Agents' is handled by _custom_handler for deprecation warning
     'Task': ('praisonaiagents.task.task', 'Task'),
     'AutoAgents': ('praisonaiagents.agents.autoagents', 'AutoAgents'),
@@ -234,9 +235,11 @@ _LAZY_IMPORTS = {
     # Session
     'Session': ('praisonaiagents.session', 'Session'),
     
-    # App (AgentApp protocol and config)
-    'AgentAppProtocol': ('praisonaiagents.app.protocols', 'AgentAppProtocol'),
-    'AgentAppConfig': ('praisonaiagents.app.config', 'AgentAppConfig'),
+    # AgentOS (primary) / AgentApp (alias) - protocol and config
+    'AgentOSProtocol': ('praisonaiagents.app.protocols', 'AgentOSProtocol'),
+    'AgentOSConfig': ('praisonaiagents.app', 'AgentOSConfig'),
+    'AgentAppProtocol': ('praisonaiagents.app.protocols', 'AgentAppProtocol'),  # Silent alias
+    'AgentAppConfig': ('praisonaiagents.app.config', 'AgentAppConfig'),  # Silent alias
     
     # MCP (optional)
     'MCP': ('praisonaiagents.mcp.mcp', 'MCP'),
@@ -425,45 +428,20 @@ def _custom_handler(name, cache):
     """Handle special cases that need custom logic."""
     import warnings
     
-    # Agents deprecation warning (use AgentManager instead)
+    # Agents is a silent alias for AgentManager
     if name == "Agents":
-        warnings.warn(
-            "Agents is deprecated, use AgentManager instead. "
-            "Example: from praisonaiagents import AgentManager",
-            DeprecationWarning,
-            stacklevel=4
-        )
         value = lazy_import('praisonaiagents.agents.agents', 'AgentManager', cache)
         cache['AgentManager'] = value
         cache['Agents'] = value
         return value
     
-    # PraisonAIAgents deprecation warning (use AgentManager instead)
-    if name == "PraisonAIAgents":
-        warnings.warn(
-            "PraisonAIAgents is deprecated, use AgentManager instead. "
-            "Example: from praisonaiagents import AgentManager",
-            DeprecationWarning,
-            stacklevel=4
+    # Task removed in v4.0.0 - use Task instead
+    if name == "Task":
+        raise ImportError(
+            "Task has been removed in v4.0.0. Use Task instead.\n"
+            "Migration: Replace 'from praisonaiagents import Task' with 'from praisonaiagents import Task'\n"
+            "Task supports all Task features including action, handler, loop_over, etc."
         )
-        value = lazy_import('praisonaiagents.agents.agents', 'AgentManager', cache)
-        cache['AgentManager'] = value
-        cache['PraisonAIAgents'] = value
-        return value
-    
-    # WorkflowStep deprecation warning (use Task instead) - Phase 4 Consolidation
-    if name == "WorkflowStep":
-        warnings.warn(
-            "WorkflowStep is deprecated, use Task instead. "
-            "Task now supports all WorkflowStep features including action, handler, loop_over, etc. "
-            "Example: from praisonaiagents import Task",
-            DeprecationWarning,
-            stacklevel=4
-        )
-        value = lazy_import('praisonaiagents.task.task', 'Task', cache)
-        cache['Task'] = value
-        cache['WorkflowStep'] = value
-        return value
     
     # Module imports (return the module itself)
     if name == 'memory':
@@ -599,9 +577,15 @@ def warmup(include_litellm: bool = False, include_openai: bool = True) -> dict:
 __all__ = [
     # Core classes - the essentials
     'Agent',
-    'AgentManager',  # Primary class for multi-agent coordination (v0.14.16+)
-    'Agents',  # Deprecated alias for AgentManager
+    'AgentTeam',  # Primary class for multi-agent coordination (v1.0+)
+    'AgentManager',  # Silent alias for AgentTeam
+    'Agents',  # Deprecated alias for AgentTeam (emits warning)
     'Task',
+    
+    # AgentFlow (deterministic pipelines)
+    'AgentFlow',  # Primary class for workflows (v1.0+)
+    'Workflow',  # Silent alias for AgentFlow
+    'Pipeline',  # Silent alias for AgentFlow
     
     # Tool essentials
     'tool',
@@ -650,7 +634,7 @@ def __dir__():
 # - Session, Memory, db, obs, Knowledge, Chunking
 # - GuardrailResult, LLMGuardrail, Handoff, handoff, handoff_filters
 # - MemoryConfig, KnowledgeConfig, PlanningConfig, OutputConfig, etc.
-# - Workflow, WorkflowStep, Route, Parallel, Loop, Repeat, Pipeline, etc.
+# - Workflow, Task, Route, Parallel, Loop, Repeat, Pipeline, etc.
 # - MCP, FlowDisplay, track_workflow, FastContext, etc.
 # - Plan, PlanStep, TodoList, PlanningAgent, ApprovalCallback, etc.
 # - RAG, RAGConfig, RAGResult, AGUI, A2A, etc.

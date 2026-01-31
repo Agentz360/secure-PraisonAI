@@ -5,15 +5,15 @@ Demonstrates conditional branching in workflows where steps can route
 to different next steps based on output content.
 """
 
-from praisonaiagents import Workflow, WorkflowStep
-from praisonaiagents.workflows import WorkflowManager
+from praisonaiagents import AgentFlow, Task
+from praisonaiagents import AgentFlowManager
 
 # Create a workflow with branching
-workflow = Workflow(
+workflow = AgentFlow(
     name="Decision Workflow",
     description="A workflow that branches based on validation result",
     steps=[
-        WorkflowStep(
+        Task(
             name="validate",
             action="Check if the number 42 is positive. Reply with 'valid' or 'invalid'.",
             routing={
@@ -24,11 +24,11 @@ workflow = Workflow(
                 }
             }
         ),
-        WorkflowStep(
+        Task(
             name="success_handler",
             action="The validation passed! Generate a success message."
         ),
-        WorkflowStep(
+        Task(
             name="error_handler",
             action="The validation failed. Generate an error message."
         )

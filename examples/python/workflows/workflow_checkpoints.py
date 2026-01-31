@@ -5,27 +5,27 @@ Demonstrates saving and resuming workflow execution using checkpoints.
 Useful for long-running workflows that may be interrupted.
 """
 
-from praisonaiagents import Workflow, WorkflowStep
-from praisonaiagents.workflows import WorkflowManager
+from praisonaiagents import AgentFlow, Task
+from praisonaiagents import AgentFlowManager
 
 # Create a multi-step workflow
-workflow = Workflow(
+workflow = AgentFlow(
     name="Long Process",
     description="A workflow with checkpoints for resumability",
     steps=[
-        WorkflowStep(
+        Task(
             name="step1",
             action="Initialize the process and prepare data."
         ),
-        WorkflowStep(
+        Task(
             name="step2", 
             action="Process the first batch of data."
         ),
-        WorkflowStep(
+        Task(
             name="step3",
             action="Process the second batch of data."
         ),
-        WorkflowStep(
+        Task(
             name="step4",
             action="Finalize and generate report."
         )
