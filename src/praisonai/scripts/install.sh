@@ -31,17 +31,17 @@ PYTHON_CMD="${PRAISONAI_PYTHON:-}"
 SKIP_VENV="${PRAISONAI_SKIP_VENV:-0}"
 MIN_PYTHON_VERSION="3.10"
 
-# Logging functions
+# Logging functions - all output to stderr to avoid capturing in $()
 log_info() {
-    echo -e "${BLUE}==>${NC} $1"
+    echo -e "${BLUE}==>${NC} $1" >&2
 }
 
 log_success() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}✓${NC} $1" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    echo -e "${YELLOW}⚠${NC} $1" >&2
 }
 
 log_error() {
@@ -49,7 +49,7 @@ log_error() {
 }
 
 log_step() {
-    echo -e "${CYAN}→${NC} $1"
+    echo -e "${CYAN}→${NC} $1" >&2
 }
 
 # Print banner
@@ -350,17 +350,17 @@ install_praisonai() {
         pip_cmd="$venv_dir/Scripts/pip.exe"
     fi
     
-    # Build install command
-    local install_pkg="praisonaiagents"
+    # Build install command - default is praisonai[all] for full experience
+    local install_pkg="praisonai[all]"
     if [[ "$VERSION" != "latest" ]]; then
-        install_pkg="praisonaiagents==$VERSION"
+        install_pkg="praisonai[all]==$VERSION"
     fi
     
-    # Add extras if specified
+    # Override extras if specified
     if [[ -n "$EXTRAS" ]]; then
-        install_pkg="praisonaiagents[$EXTRAS]"
+        install_pkg="praisonai[$EXTRAS]"
         if [[ "$VERSION" != "latest" ]]; then
-            install_pkg="praisonaiagents[$EXTRAS]==$VERSION"
+            install_pkg="praisonai[$EXTRAS]==$VERSION"
         fi
     fi
     
@@ -465,7 +465,7 @@ verify_installation() {
     fi
     
     # Check import
-    if $python_cmd -c "import praisonaiagents; print(f'Version: {praisonaiagents.__version__}')" 2>/dev/null; then
+    if $python_cmd -c "from praisonaiagents import Agent; print('Import successful')" 2>/dev/null; then
         log_success "PraisonAI agents package verified"
     else
         log_error "Failed to import praisonaiagents"

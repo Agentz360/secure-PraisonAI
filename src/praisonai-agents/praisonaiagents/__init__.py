@@ -150,10 +150,12 @@ _LAZY_IMPORTS = {
     'Parallel': ('praisonaiagents.workflows', 'Parallel'),
     'Loop': ('praisonaiagents.workflows', 'Loop'),
     'Repeat': ('praisonaiagents.workflows', 'Repeat'),
+    'If': ('praisonaiagents.workflows', 'If'),
     'route': ('praisonaiagents.workflows', 'route'),
     'parallel': ('praisonaiagents.workflows', 'parallel'),
     'loop': ('praisonaiagents.workflows', 'loop'),
     'repeat': ('praisonaiagents.workflows', 'repeat'),
+    'when': ('praisonaiagents.workflows', 'when'),
     
     # Handoff
     'Handoff': ('praisonaiagents.agent.handoff', 'Handoff'),
@@ -586,6 +588,12 @@ __all__ = [
     'AgentFlow',  # Primary class for workflows (v1.0+)
     'Workflow',  # Silent alias for AgentFlow
     'Pipeline',  # Silent alias for AgentFlow
+    
+    # AgentOS (production deployment protocols)
+    'AgentOSProtocol',  # Primary protocol for deployment (v1.0+)
+    'AgentOSConfig',  # Primary config for deployment (v1.0+)
+    'AgentAppProtocol',  # Silent alias for AgentOSProtocol
+    'AgentAppConfig',  # Silent alias for AgentOSConfig
     
     # Tool essentials
     'tool',
