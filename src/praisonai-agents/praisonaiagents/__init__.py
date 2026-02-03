@@ -157,6 +157,13 @@ _LAZY_IMPORTS = {
     'repeat': ('praisonaiagents.workflows', 'repeat'),
     'when': ('praisonaiagents.workflows', 'when'),
     
+    # Conditions (Protocol-driven condition evaluation)
+    'ConditionProtocol': ('praisonaiagents.conditions.protocols', 'ConditionProtocol'),
+    'RoutingConditionProtocol': ('praisonaiagents.conditions.protocols', 'RoutingConditionProtocol'),
+    'ExpressionCondition': ('praisonaiagents.conditions.evaluator', 'ExpressionCondition'),
+    'DictCondition': ('praisonaiagents.conditions.evaluator', 'DictCondition'),
+    'evaluate_condition': ('praisonaiagents.conditions.evaluator', 'evaluate_condition'),
+    
     # Handoff
     'Handoff': ('praisonaiagents.agent.handoff', 'Handoff'),
     'handoff': ('praisonaiagents.agent.handoff', 'handoff'),
@@ -423,6 +430,46 @@ _LAZY_IMPORTS = {
     'ProviderStatus': ('praisonaiagents.llm.failover', 'ProviderStatus'),
     'FailoverConfig': ('praisonaiagents.llm.failover', 'FailoverConfig'),
     'FailoverManager': ('praisonaiagents.llm.failover', 'FailoverManager'),
+    
+    # Plugins - Core classes
+    'PluginManager': ('praisonaiagents.plugins', 'PluginManager'),
+    'Plugin': ('praisonaiagents.plugins', 'Plugin'),
+    'PluginInfo': ('praisonaiagents.plugins', 'PluginInfo'),
+    'PluginHook': ('praisonaiagents.plugins', 'PluginHook'),
+    'FunctionPlugin': ('praisonaiagents.plugins', 'FunctionPlugin'),
+    'get_plugin_manager': ('praisonaiagents.plugins', 'get_plugin_manager'),
+    
+    # Plugins - Protocols
+    'PluginProtocol': ('praisonaiagents.plugins', 'PluginProtocol'),
+    'ToolPluginProtocol': ('praisonaiagents.plugins', 'ToolPluginProtocol'),
+    'HookPluginProtocol': ('praisonaiagents.plugins', 'HookPluginProtocol'),
+    'AgentPluginProtocol': ('praisonaiagents.plugins', 'AgentPluginProtocol'),
+    'LLMPluginProtocol': ('praisonaiagents.plugins', 'LLMPluginProtocol'),
+    
+    # Plugins - Single-file plugin support
+    'PluginMetadata': ('praisonaiagents.plugins', 'PluginMetadata'),
+    'PluginParseError': ('praisonaiagents.plugins', 'PluginParseError'),
+    'parse_plugin_header': ('praisonaiagents.plugins', 'parse_plugin_header'),
+    'parse_plugin_header_from_file': ('praisonaiagents.plugins', 'parse_plugin_header_from_file'),
+    'discover_plugins': ('praisonaiagents.plugins', 'discover_plugins'),
+    'load_plugin': ('praisonaiagents.plugins', 'load_plugin'),
+    'discover_and_load_plugins': ('praisonaiagents.plugins', 'discover_and_load_plugins'),
+    'get_default_plugin_dirs': ('praisonaiagents.plugins', 'get_default_plugin_dirs'),
+    'get_plugin_template': ('praisonaiagents.plugins', 'get_plugin_template'),
+    'ensure_plugin_dir': ('praisonaiagents.plugins', 'ensure_plugin_dir'),
+    
+    # Config loader - for config-driven defaults
+    'get_config': ('praisonaiagents.config.loader', 'get_config'),
+    'get_default': ('praisonaiagents.config.loader', 'get_default'),
+    'get_plugins_config': ('praisonaiagents.config.loader', 'get_plugins_config'),
+    'get_defaults_config': ('praisonaiagents.config.loader', 'get_defaults_config'),
+    'apply_config_defaults': ('praisonaiagents.config.loader', 'apply_config_defaults'),
+    'validate_config': ('praisonaiagents.config.loader', 'validate_config'),
+    'get_config_path': ('praisonaiagents.config.loader', 'get_config_path'),
+    'ConfigValidationError': ('praisonaiagents.config.loader', 'ConfigValidationError'),
+    'PraisonConfig': ('praisonaiagents.config.loader', 'PraisonConfig'),
+    'PluginsConfig': ('praisonaiagents.config.loader', 'PluginsConfig'),
+    'DefaultsConfig': ('praisonaiagents.config.loader', 'DefaultsConfig'),
 }
 
 
